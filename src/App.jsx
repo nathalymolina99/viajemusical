@@ -1,10 +1,8 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import ReactPlayer from 'react-player';
-import { QRCodeSVG } from 'qrcode.react';
+import { QRCodeCanvas } from 'qrcode.react';
 import { QrReader } from 'react-qr-reader';
-import { Play, Pause, Camera, PlusCircle, CheckCircle2, Printer, ArrowLeft, FileSpreadsheet } from 'lucide-react';
-
-const pastelColors = ['#BAE1FF', '#BAFFC9', '#FFFFBA', '#FFDFBA', '#FFB3BA', '#E8B9AB'];
+import { Play, Pause, Camera, PlusCircle, CheckCircle2, Download } from 'lucide-react';
 
 // Mantener las opciones estables evita reiniciar el lector en cada cambio de pantalla.
 const CAMERA_CONSTRAINTS = { facingMode: { ideal: 'environment' } };
@@ -14,11 +12,11 @@ const CAMERA_VIDEO_STYLE = { display: 'block', width: '100%', height: '100%', ob
 
 export default function HitsterApp() {
   const [view, setView] = useState('menu'); 
-  const [cards, setCards] = useState([]);
-  
   const [formData, setFormData] = useState({ title: '', artist: '', year: '', youtubeId: '' });
-  const [bulkData, setBulkData] = useState('');
-  const [importMode, setImportMode] = useState('single');
+  // Se guarda una sola canción generada; no se fabrican tarjetas ni PDFs.
+  const [qrSong, setQrSong] = useState(null);
+  const [qrError, setQrError] = useState('');
+  const qrCanvasRef = useRef(null);
 
   const [currentSong, setCurrentSong] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -62,41 +60,57 @@ export default function HitsterApp() {
     }
   };
 
-  const generateId = () => Date.now().toString() + Math.random().toString(36).substring(2, 11);
-
-  const handleCreateCard = (e) => {
-    e.preventDefault();
-    const videoId = extractYouTubeID(formData.youtubeId);
-    if (!videoId) {
-      alert('El enlace de YouTube no es válido. Comprueba el link antes de crear la tarjeta.');
+  // Genera el QR con los datos que el escáner existente necesita.
+  const handleGenerateQR = (event) => {
+    event.preventDefault();
+    const youtubeId = extractYouTubeID(formData.youtubeId);
+    if (!youtubeId) {
+      setQrError('El enlace de YouTube no es válido. Revisa el link e inténtalo otra vez.');
+      setQrSong(null);
       return;
     }
-    const newCard = { ...formData, youtubeId: videoId, id: generateId() };
-    setCards(previous => [...previous, newCard]);
-    setFormData({ title: '', artist: '', year: '', youtubeId: '' });
+    setQrError('');
+    setQrSong({
+      year: String(formData.year).trim(),
+      artist: formData.artist.trim(),
+      title: formData.title.trim(),
+      youtubeId,
+    });
   };
 
-  const handleBulkImport = () => {
-    if (!bulkData.trim()) return;
-    const lines = bulkData.split('\n');
-    const newCards = [];
-    let errors = 0;
-    lines.forEach(line => {
-      const cols = line.split('\t');
-      if (cols.length >= 4) {
-        const year = cols[0].trim();
-        const artist = cols[1].trim();
-        const title = cols[2].trim();
-        const link = cols[3].trim();
-        const videoId = extractYouTubeID(link);
-        if (year && artist && title && videoId) {
-          newCards.push({ title, artist, year, youtubeId: videoId, id: generateId() });
-        } else errors++;
-      } else if (line.trim() !== '') errors++;
-    });
-    setCards(previous => [...previous, ...newCards]);
-    setBulkData('');
-    alert(`¡Éxito! Se importaron ${newCards.length} tarjetas.\n${errors > 0 ? `Hubo ${errors} errores.` : ''}`);
+  // Guarda un PNG con fondo blanco, margen y resolución alta para diseñar tarjetas.
+  const handleDownloadQR = () => {
+    if (!qrSong || !qrCanvasRef.current) return;
+    try {
+      const canvas = qrCanvasRef.current;
+      const png = canvas.toDataURL('image/png');
+      const clean = (value) => String(value)
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-zA-Z0-9_-]+/g, '_')
+        .replace(/^_+|_+$/g, '').slice(0, 45);
+      const filename = `QR_${clean(qrSong.artist)}_${clean(qrSong.title)}.png`;
+      const link = document.createElement('a');
+      link.href = png;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    } catch {
+      setQrError('No se pudo descargar la imagen. Prueba desde Chrome o Safari.');
+    }
+  };
+
+  const handleNewQR = () => {
+    setFormData({ title: '', artist: '', year: '', youtubeId: '' });
+    setQrSong(null);
+    setQrError('');
+  };
+
+  const updateField = (key, value) => {
+    setFormData((previous) => ({ ...previous, [key]: value }));
+    // Evita descargar por accidente un QR que corresponda a datos anteriores.
+    setQrSong(null);
+    setQrError('');
   };
 
   // Un único lector para toda la sesión: no se desmonta al abrir una canción.
@@ -190,52 +204,6 @@ export default function HitsterApp() {
   };
 
   // ==========================================
-  // VISTA DE IMPRESIÓN (PDF)
-  // ==========================================
-  if (view === 'print') {
-    return (
-      <div className="bg-white text-black min-h-screen w-full font-sans">
-        <div className="print:hidden bg-gray-900 text-white p-4 flex justify-between items-center shadow-md">
-          <button onClick={() => setView('creator')} className="flex items-center gap-2 hover:text-yellow-400 font-bold transition-colors"><ArrowLeft size={24} /> Volver</button>
-          <h2 className="text-xl font-bold">PDF ({cards.length} Tarjetas)</h2>
-          <button onClick={() => window.print()} className="bg-yellow-500 hover:bg-yellow-600 text-black px-6 py-2 rounded-lg font-black flex items-center gap-2 shadow-lg"><Printer size={20} /> Guardar PDF</button>
-        </div>
-        <div className="p-8 print:p-0 w-full flex flex-col items-center">
-          <div className="w-full max-w-[210mm] mb-12 print:mb-0">
-            <h3 className="print:hidden text-2xl font-black mb-6 text-center border-b pb-2">Cara 1: Datos</h3>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 65mm)', gap: '2mm', justifyContent: 'center' }}>
-              {cards.map((card, idx) => (
-                <div key={`data-${card.id}`} style={{ width: '65mm', height: '65mm', backgroundColor: pastelColors[idx % pastelColors.length], border: '1px dashed #999', boxSizing: 'border-box', padding: '5mm', position: 'relative', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', pageBreakInside: 'avoid' }}>
-                  <span style={{ position: 'absolute', top: '3mm', left: '3mm', fontSize: '11px', fontWeight: '900', color: '#333' }}>#{idx + 1}</span>
-                  <div style={{ fontSize: '32px', fontWeight: '900', color: '#000', lineHeight: '1', marginBottom: '4px', textAlign: 'center' }}>{card.year}</div>
-                  <div style={{ fontSize: '12px', fontWeight: '900', color: '#000', textAlign: 'center', textTransform: 'uppercase', lineHeight: '1.2', marginBottom: '3px' }}>{card.artist}</div>
-                  <div style={{ fontSize: '11px', color: '#222', textAlign: 'center', fontStyle: 'italic', lineHeight: '1.1' }}>{card.title}</div>
-                </div>
-              ))}
-            </div>
-          </div>
-          <div style={{ pageBreakBefore: 'always' }} className="print:block w-full hidden"></div>
-          <hr className="print:hidden w-full max-w-[210mm] border-gray-400 border-2 my-12" />
-          <div className="w-full max-w-[210mm]">
-            <h3 className="print:hidden text-2xl font-black mb-6 text-center border-b pb-2">Cara 2: QRs</h3>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 65mm)', gap: '2mm', justifyContent: 'center' }}>
-              {cards.map((card, idx) => (
-                <div key={`qr-${card.id}`} style={{ width: '65mm', height: '65mm', background: 'linear-gradient(135deg, #111111 0%, #2b2b2b 50%, #0a0a0a 100%)', border: '1px dashed #ccc', boxSizing: 'border-box', position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center', pageBreakInside: 'avoid' }}>
-                  <div style={{ position: 'absolute', top: '2.5mm', bottom: '2.5mm', left: '2.5mm', right: '2.5mm', border: '2px solid #EAB308', borderRadius: '4px' }}></div>
-                  <span style={{ position: 'absolute', top: '3.5mm', left: '4mm', fontSize: '11px', fontWeight: '900', color: '#EAB308' }}>#{idx + 1}</span>
-                  <div style={{ background: '#fff', padding: '3mm', borderRadius: '4px', zIndex: 10 }}>
-                    <QRCodeSVG value={JSON.stringify({ ...card })} size={120} />
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // ==========================================
   // VISTA PRINCIPAL
   // ==========================================
   return (
@@ -255,7 +223,7 @@ export default function HitsterApp() {
             <Camera size={28} /> Escanear Tarjeta
           </button>
           <button onClick={() => setView('creator')} className="flex items-center justify-center gap-3 bg-gray-800 hover:bg-gray-700 text-white p-6 rounded-2xl text-xl font-bold border border-gray-700">
-            <PlusCircle size={28} /> Generar Tarjetas
+            <PlusCircle size={28} /> Crear código QR
           </button>
         </div>
       )}
@@ -306,29 +274,74 @@ export default function HitsterApp() {
 
       {view === 'creator' && (
         <div className="w-full max-w-md bg-gray-800 p-6 rounded-2xl shadow-xl z-10">
-          <div className="flex gap-2 mb-6 border-b border-gray-700 pb-2">
-            <button onClick={() => setImportMode('single')} className={`flex-1 py-2 font-bold rounded-t-lg transition-colors ${importMode === 'single' ? 'bg-gray-700 text-yellow-400' : 'text-gray-400 hover:text-white'}`}>Una por una</button>
-            <button onClick={() => setImportMode('bulk')} className={`flex-1 py-2 font-bold rounded-t-lg transition-colors flex items-center justify-center gap-2 ${importMode === 'bulk' ? 'bg-gray-700 text-green-400' : 'text-gray-400 hover:text-white'}`}><FileSpreadsheet size={18}/> Desde Excel</button>
-          </div>
-          {importMode === 'single' ? (
-            <form onSubmit={handleCreateCard} className="flex flex-col gap-4">
-              <input required type="number" placeholder="Año Original" className="p-3 bg-gray-700 rounded-lg text-white" value={formData.year} onChange={e => setFormData({...formData, year: e.target.value})} />
-              <input required type="text" placeholder="Artista" className="p-3 bg-gray-700 rounded-lg text-white" value={formData.artist} onChange={e => setFormData({...formData, artist: e.target.value})} />
-              <input required type="text" placeholder="Nombre de la Canción" className="p-3 bg-gray-700 rounded-lg text-white" value={formData.title} onChange={e => setFormData({...formData, title: e.target.value})} />
-              <input required type="text" placeholder="Link de YouTube" className="p-3 bg-gray-700 rounded-lg text-white" value={formData.youtubeId} onChange={e => setFormData({...formData, youtubeId: e.target.value})} />
-              <button type="submit" className="bg-yellow-500 hover:bg-yellow-600 text-black font-bold p-3 rounded-lg mt-2">Añadir a la lista (+1)</button>
-            </form>
-          ) : (
-            <div className="flex flex-col gap-4">
-              <p className="text-sm text-gray-400">1. Copia desde tu Excel:<br/><span className="text-white font-bold">AÑO | ARTISTA | CANCIÓN | LINK YOUTUBE</span><br/>2. Pega todo abajo:</p>
-              <textarea className="w-full h-40 p-3 bg-gray-700 rounded-lg text-white text-sm" value={bulkData} onChange={e => setBulkData(e.target.value)} />
-              <button onClick={handleBulkImport} className="bg-green-500 hover:bg-green-600 text-white font-bold p-3 rounded-lg mt-2 flex items-center justify-center gap-2"><FileSpreadsheet size={20} /> Importar Datos</button>
+          <h2 className="text-2xl font-black text-yellow-400 text-center mb-2">Generar código QR</h2>
+          <p className="text-gray-300 text-sm text-center mb-6">
+            Ingresa la información de la canción. Descargarás únicamente el QR, sin tarjeta ni PDF.
+          </p>
+
+          <form onSubmit={handleGenerateQR} className="flex flex-col gap-4">
+            <label className="flex flex-col gap-1 text-sm font-semibold text-gray-200">
+              Año de lanzamiento
+              <input required type="number" placeholder="Ej. 1998" className="p-3 bg-gray-700 rounded-lg text-white"
+                value={formData.year} onChange={(e) => updateField('year', e.target.value)} />
+            </label>
+            <label className="flex flex-col gap-1 text-sm font-semibold text-gray-200">
+              Artista
+              <input required type="text" placeholder="Ej. Shakira" className="p-3 bg-gray-700 rounded-lg text-white"
+                value={formData.artist} onChange={(e) => updateField('artist', e.target.value)} />
+            </label>
+            <label className="flex flex-col gap-1 text-sm font-semibold text-gray-200">
+              Nombre de la canción
+              <input required type="text" placeholder="Ej. Ciega, sordomuda" className="p-3 bg-gray-700 rounded-lg text-white"
+                value={formData.title} onChange={(e) => updateField('title', e.target.value)} />
+            </label>
+            <label className="flex flex-col gap-1 text-sm font-semibold text-gray-200">
+              Enlace de YouTube
+              <input required type="text" placeholder="Pega el link del video" className="p-3 bg-gray-700 rounded-lg text-white"
+                value={formData.youtubeId} onChange={(e) => updateField('youtubeId', e.target.value)} />
+            </label>
+            <button type="submit" className="bg-yellow-500 hover:bg-yellow-600 text-black font-black p-4 rounded-xl mt-2">
+              GENERAR QR
+            </button>
+          </form>
+
+          {qrError && (
+            <p role="alert" className="mt-4 text-red-200 bg-red-950 border border-red-600 rounded-lg p-3 text-sm">{qrError}</p>
+          )}
+
+          {qrSong && (
+            <div className="mt-7 border-t border-gray-600 pt-6 flex flex-col items-center gap-4">
+              <p className="text-green-400 font-bold text-center">¡Tu QR está listo!</p>
+              {/* El archivo descargado contiene solo el QR en negro sobre blanco. */}
+              <div className="bg-white rounded-xl p-3 flex items-center justify-center">
+                <QRCodeCanvas
+                  ref={qrCanvasRef}
+                  value={JSON.stringify(qrSong)}
+                  size={700}
+                  level="M"
+                  marginSize={4}
+                  bgColor="#FFFFFF"
+                  fgColor="#000000"
+                  style={{ display: 'block', width: '240px', height: '240px' }}
+                />
+              </div>
+              <p className="text-sm text-gray-300 text-center">
+                {qrSong.artist} — {qrSong.title} ({qrSong.year})
+              </p>
+              <button type="button" onClick={handleDownloadQR}
+                className="w-full bg-green-500 hover:bg-green-600 text-white font-black p-4 rounded-xl flex items-center justify-center gap-2">
+                <Download size={23} /> DESCARGAR QR EN PNG
+              </button>
+              <button type="button" onClick={handleNewQR}
+                className="w-full p-3 rounded-lg border border-gray-500 hover:bg-gray-700 font-semibold">
+                Crear otro QR
+              </button>
             </div>
           )}
-          <div className="mt-8 border-t border-gray-700 pt-6">
-            <button onClick={() => cards.length > 0 ? setView('print') : alert("Agrega canciones")} className={`w-full text-white font-bold p-4 rounded-xl flex items-center justify-center gap-2 shadow-lg transition-colors ${cards.length > 0 ? 'bg-blue-500 hover:bg-blue-600 animate-pulse' : 'bg-gray-600 opacity-50'}`}><Printer size={24} /> Generar PDF ({cards.length})</button>
-            <button onClick={() => setView('menu')} className="w-full text-center mt-4 text-sm text-gray-400 hover:text-white underline">Volver al menú</button>
-          </div>
+
+          <button onClick={() => setView('menu')} className="w-full text-center mt-6 text-sm text-gray-400 hover:text-white underline">
+            Volver al menú
+          </button>
         </div>
       )}
 
