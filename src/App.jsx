@@ -21,9 +21,6 @@ export default function HitsterApp() {
   const [isReady, setIsReady] = useState(false);
   const [gyroEnabled, setGyroEnabled] = useState(false);
   
-  // NUEVO: Estado para saber si YouTube ya cargó la canción
-  const [isVideoLoaded, setIsVideoLoaded] = useState(false);
-  
   const playerRef = useRef(null);
   const playTimerRef = useRef(null);
 
@@ -76,7 +73,6 @@ export default function HitsterApp() {
           setIsPlaying(false);
           setGyroEnabled(false);
           setIsReady(false); 
-          setIsVideoLoaded(false); // Reiniciamos el estado de carga
           setView('player');
         }
       } catch {
@@ -117,11 +113,11 @@ export default function HitsterApp() {
       setGyroEnabled(true); 
     }
 
-    // Le damos play real para que iOS registre el toque
+    // El truco para iOS: Usamos el tap del usuario para despertar el audio
     setIsPlaying(true);
     setTimeout(() => {
       setIsPlaying(false);
-    }, 400); // 400ms para asegurar que el navegador lo detecte
+    }, 500);
   };
 
   useEffect(() => {
@@ -136,18 +132,16 @@ export default function HitsterApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gyroEnabled, isPlaying, isRevealed, isReady]);
 
-  // VISTA DE IMPRESIÓN PDF...
+  // ==========================================
+  // VISTA DE IMPRESIÓN (PDF)
+  // ==========================================
   if (view === 'print') {
     return (
       <div className="bg-white text-black min-h-screen w-full font-sans">
         <div className="print:hidden bg-gray-900 text-white p-4 flex justify-between items-center shadow-md">
-          <button onClick={() => setView('creator')} className="flex items-center gap-2 hover:text-yellow-400 font-bold transition-colors">
-            <ArrowLeft size={24} /> Volver
-          </button>
+          <button onClick={() => setView('creator')} className="flex items-center gap-2 hover:text-yellow-400 font-bold transition-colors"><ArrowLeft size={24} /> Volver</button>
           <h2 className="text-xl font-bold">PDF ({cards.length} Tarjetas)</h2>
-          <button onClick={() => window.print()} className="bg-yellow-500 hover:bg-yellow-600 text-black px-6 py-2 rounded-lg font-black flex items-center gap-2 shadow-lg">
-            <Printer size={20} /> Guardar PDF
-          </button>
+          <button onClick={() => window.print()} className="bg-yellow-500 hover:bg-yellow-600 text-black px-6 py-2 rounded-lg font-black flex items-center gap-2 shadow-lg"><Printer size={20} /> Guardar PDF</button>
         </div>
         <div className="p-8 print:p-0 w-full flex flex-col items-center">
           <div className="w-full max-w-[210mm] mb-12 print:mb-0">
@@ -184,24 +178,24 @@ export default function HitsterApp() {
     );
   }
 
-  // VISTA NORMAL...
+  // ==========================================
+  // VISTA PRINCIPAL
+  // ==========================================
   return (
     <div className="min-h-screen bg-gray-900 text-white font-sans flex flex-col items-center justify-center p-6 relative">
       
-      {/* REPRODUCTOR OCULTO A LA VISTA PERO EN PANTALLA (Para evitar bloqueo de Safari) */}
+      {/* REPRODUCTOR OCULTO DE YOUTUBE */}
       {view === 'player' && currentSong && (
-        <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-0" style={{ opacity: 0.05 }}>
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-0" style={{ opacity: 0.01 }}>
           <ReactPlayer 
             ref={playerRef} 
             url={`https://www.youtube.com/watch?v=${currentSong.youtubeId}`} 
             playing={isPlaying} 
             onDuration={handleDuration} 
-            onReady={() => setIsVideoLoaded(true)} 
             controls={false} 
             width="200px" 
             height="200px" 
             playsinline={true}
-            volume={1}
             config={{ youtube: { playerVars: { playsinline: 1 } } }}
           />
         </div>
@@ -225,17 +219,21 @@ export default function HitsterApp() {
         </div>
       )}
 
-      {/* CÁMARA CORREGIDA */}
+      {/* CÁMARA FIX: Forzando a que se vea por encima del fondo negro */}
       {view === 'scanner' && (
         <div className="w-full max-w-md flex flex-col items-center z-10">
           <h2 className="text-2xl font-bold mb-4">Apunta al QR</h2>
-          <div className="w-full bg-black rounded-3xl overflow-hidden border-4 border-gray-700 shadow-2xl relative min-h-[300px] flex items-center justify-center">
-            <p className="absolute text-gray-500 text-center px-6 text-sm z-0">Iniciando cámara...</p>
-            <div className="w-full z-10">
+          <div className="w-full aspect-square bg-gray-800 rounded-3xl overflow-hidden border-4 border-gray-700 shadow-2xl relative flex items-center justify-center">
+            <p className="absolute text-gray-500 text-center px-6 text-sm z-0">
+              Cargando cámara...
+            </p>
+            {/* Contenedor absoluto para forzar visibilidad en iOS */}
+            <div className="absolute inset-0 z-10" style={{ width: '100%', height: '100%' }}>
               <QrReader 
                 onResult={handleScan} 
                 constraints={{ facingMode: 'environment' }} 
-                className="w-full"
+                videoStyle={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                containerStyle={{ width: '100%', height: '100%' }}
               />
             </div>
           </div>
@@ -254,7 +252,7 @@ export default function HitsterApp() {
               <input required type="number" placeholder="Año Original" className="p-3 bg-gray-700 rounded-lg text-white" value={formData.year} onChange={e => setFormData({...formData, year: e.target.value})} />
               <input required type="text" placeholder="Artista" className="p-3 bg-gray-700 rounded-lg text-white" value={formData.artist} onChange={e => setFormData({...formData, artist: e.target.value})} />
               <input required type="text" placeholder="Nombre de la Canción" className="p-3 bg-gray-700 rounded-lg text-white" value={formData.title} onChange={e => setFormData({...formData, title: e.target.value})} />
-              <input required type="text" placeholder="Link de YouTube Music" className="p-3 bg-gray-700 rounded-lg text-white" value={formData.youtubeId} onChange={e => setFormData({...formData, youtubeId: e.target.value})} />
+              <input required type="text" placeholder="Link de YouTube" className="p-3 bg-gray-700 rounded-lg text-white" value={formData.youtubeId} onChange={e => setFormData({...formData, youtubeId: e.target.value})} />
               <button type="submit" className="bg-yellow-500 hover:bg-yellow-600 text-black font-bold p-3 rounded-lg mt-2">Añadir a la lista (+1)</button>
             </form>
           ) : (
@@ -271,7 +269,7 @@ export default function HitsterApp() {
         </div>
       )}
 
-      {/* VISTA DEL JUEGO / DISCO GIRANDO */}
+      {/* VISTA DEL REPRODUCTOR (Ya sin el botón bloqueado) */}
       {view === 'player' && currentSong && (
         <div className="w-full max-w-md flex flex-col items-center justify-center bg-gray-800 p-8 rounded-3xl shadow-2xl relative overflow-hidden min-h-[500px] z-10">
           
@@ -279,19 +277,13 @@ export default function HitsterApp() {
             <div className="absolute inset-0 z-50 bg-blue-600 flex flex-col items-center justify-center p-6 text-center animate-pulse">
                 <Smartphone size={80} className="text-white mb-6 animate-bounce" />
                 <h2 className="text-3xl font-black text-white mb-4 leading-tight">¡CANCION<br/>CARGADA!</h2>
-                <p className="text-blue-100 text-lg mb-10 font-medium">Espera a que el botón se ponga amarillo. Toca el botón y pon tu teléfono boca abajo para empezar.</p>
+                <p className="text-blue-100 text-lg mb-10 font-medium">Toca el botón y pon tu teléfono boca abajo para empezar a jugar.</p>
                 
-                {/* BOTÓN INTELIGENTE: Bloqueado hasta que el video cargue */}
                 <button 
                   onClick={handleReadyClick} 
-                  disabled={!isVideoLoaded}
-                  className={`w-full py-8 font-black text-3xl rounded-3xl transition-all ${
-                    isVideoLoaded 
-                    ? 'bg-yellow-400 hover:bg-yellow-500 text-black shadow-[0_10px_0_rgb(202,138,4)] active:translate-y-2 active:shadow-[0_0px_0_rgb(202,138,4)]' 
-                    : 'bg-gray-400 text-gray-600 cursor-not-allowed shadow-[0_10px_0_rgb(156,163,175)]'
-                  }`}
+                  className="w-full py-8 font-black text-3xl rounded-3xl transition-all bg-yellow-400 hover:bg-yellow-500 text-black shadow-[0_10px_0_rgb(202,138,4)] active:translate-y-2 active:shadow-[0_0px_0_rgb(202,138,4)]"
                 >
-                  {isVideoLoaded ? '¡ESTOY LISTO!' : 'CARGANDO AUDIO...'}
+                  ¡ESTOY LISTO!
                 </button>
 
                 <button onClick={() => { setView('menu'); stopPlaying(); }} className="mt-8 text-sm text-blue-200 hover:text-white underline">Cancelar</button>
