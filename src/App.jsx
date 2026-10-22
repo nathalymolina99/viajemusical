@@ -1,10 +1,16 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import ReactPlayer from 'react-player';
 import { QRCodeSVG } from 'qrcode.react';
 import { QrReader } from 'react-qr-reader';
-import { Play, Pause, Camera, PlusCircle, CheckCircle2, Smartphone, Printer, ArrowLeft, FileSpreadsheet } from 'lucide-react';
+import { Play, Pause, Camera, PlusCircle, CheckCircle2, Printer, ArrowLeft, FileSpreadsheet } from 'lucide-react';
 
 const pastelColors = ['#BAE1FF', '#BAFFC9', '#FFFFBA', '#FFDFBA', '#FFB3BA', '#E8B9AB'];
+
+// Mantener las opciones estables evita reiniciar el lector en cada cambio de pantalla.
+const CAMERA_CONSTRAINTS = { facingMode: { ideal: 'environment' } };
+const CAMERA_CONTAINER_STYLE = { width: '100%', height: '100%', position: 'absolute', inset: 0 };
+const CAMERA_VIDEO_CONTAINER_STYLE = { width: '100%', height: '100%', paddingTop: 0, position: 'relative', overflow: 'hidden' };
+const CAMERA_VIDEO_STYLE = { display: 'block', width: '100%', height: '100%', objectFit: 'cover', position: 'absolute', top: 0, left: 0 };
 
 export default function HitsterApp() {
   const [view, setView] = useState('menu'); 
@@ -18,18 +24,20 @@ export default function HitsterApp() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isRevealed, setIsRevealed] = useState(false);
   
-  const [isReady, setIsReady] = useState(false);
-  const [gyroEnabled, setGyroEnabled] = useState(false);
+  // El lector se monta solo la primera vez, y no se desmonta entre tarjetas.
+  const [scannerInitialized, setScannerInitialized] = useState(false);
   const [scannerError, setScannerError] = useState('');
   const [playerError, setPlayerError] = useState('');
   const [playerReady, setPlayerReady] = useState(false);
-  const [showYouTubePlayer, setShowYouTubePlayer] = useState(false);
   
   const playerRef = useRef(null);
   const playTimerRef = useRef(null);
   const songAlreadyScannedRef = useRef(false);
   const didSeekRef = useRef(false);
-  const playbackSourceRef = useRef(null);
+  const viewRef = useRef(view);
+  useEffect(() => {
+  viewRef.current = view;
+}, [view]);
 
   // Admite URL normal, enlace corto, Shorts o un ID directo de YouTube.
   const extractYouTubeID = (value) => {
@@ -89,12 +97,13 @@ export default function HitsterApp() {
     alert(`¡Éxito! Se importaron ${newCards.length} tarjetas.\n${errors > 0 ? `Hubo ${errors} errores.` : ''}`);
   };
 
-  // Los errores habituales de lectura de QR no son fallos de la cámara.
-  // Aquí sí se muestran los errores de permiso, cámara no disponible o conexión insegura.
-  const handleScan = (result, error) => {
+  // Un único lector para toda la sesión: no se desmonta al abrir una canción.
+  // El navegador decide si recuerda el permiso entre visitas o recargas.
+  const handleScan = useCallback((result, error) => {
+    if (viewRef.current !== 'scanner') return;
     if (error) {
       if (['NotAllowedError', 'PermissionDeniedError', 'SecurityError'].includes(error.name)) {
-        setScannerError('Permite el acceso a la cámara en la configuración de este sitio y vuelve a cargar la página.');
+        setScannerError('Autoriza la cámara en los permisos de este sitio. Para que el navegador lo recuerde, selecciona «Permitir» de forma permanente si aparece esa opción.');
       } else if (['NotFoundError', 'DevicesNotFoundError', 'OverconstrainedError'].includes(error.name)) {
         setScannerError('No se encontró la cámara. Comprueba que esté conectada o prueba con otro navegador.');
       } else if (['NotReadableError', 'TrackStartError'].includes(error.name)) {
@@ -116,17 +125,14 @@ export default function HitsterApp() {
       setCurrentSong(scannedData);
       setIsRevealed(false);
       setIsPlaying(false);
-      playbackSourceRef.current = null;
-      setGyroEnabled(false);
-      setIsReady(false);
       setPlayerReady(false);
       setPlayerError('');
-      setShowYouTubePlayer(false);
       setView('player');
+      viewRef.current = 'player';
     } catch {
       setScannerError('El código escaneado no es una tarjeta de Hitster Pro.');
     }
-  };
+  }, []);
 
   // ReactPlayer 3 entrega la duración y expone currentTime (no seekTo).
   // Se elige aleatoriamente un segmento de hasta 30 segundos.
@@ -143,28 +149,25 @@ export default function HitsterApp() {
     }
   };
 
-  const startPlaying = (source = 'manual') => {
+  const startPlaying = () => {
     if (isRevealed) return;
-    playbackSourceRef.current = source;
     setPlayerError('');
     setIsPlaying(true);
   };
 
   const stopPlaying = () => {
-    playbackSourceRef.current = null;
     setIsPlaying(false);
     if (playTimerRef.current) clearTimeout(playTimerRef.current);
     playTimerRef.current = null;
   };
 
-  const togglePlay = () => isPlaying ? stopPlaying() : startPlaying('manual');
+  const togglePlay = () => isPlaying ? stopPlaying() : startPlaying();
 
   const handleActuallyPlaying = () => {
     // El contador comienza cuando YouTube inicia el audio, no mientras carga.
     setIsPlaying(true);
     if (playTimerRef.current) clearTimeout(playTimerRef.current);
     playTimerRef.current = setTimeout(() => {
-      playbackSourceRef.current = null;
       setIsPlaying(false);
     }, 30000);
   };
@@ -173,21 +176,9 @@ export default function HitsterApp() {
     if (playTimerRef.current) clearTimeout(playTimerRef.current);
   }, []);
 
-  const handleReadyClick = () => {
-    setIsReady(true);
-    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
-      DeviceOrientationEvent.requestPermission().then(state => {
-        setGyroEnabled(state === 'granted');
-      }).catch(() => setGyroEnabled(false));
-    } else if (typeof DeviceOrientationEvent !== 'undefined') {
-      setGyroEnabled(true);
-    }
-    // No activar y detener el audio durante 500 ms: YouTube puede tardar en cargar.
-    // En el siguiente paso la persona pulsa PLAY, lo que ayuda a desbloquear sonido móvil.
-  };
-
   const openScanner = () => {
     songAlreadyScannedRef.current = false;
+    setScannerInitialized(true);
     setScannerError(
       typeof window !== 'undefined' && !window.isSecureContext
         ? 'Abre el juego desde un sitio HTTPS (o localhost). En HTTP la cámara puede estar bloqueada.'
@@ -195,18 +186,6 @@ export default function HitsterApp() {
     );
     setView('scanner');
   };
-
-  useEffect(() => {
-    const handleOrientation = (event) => {
-      if (!gyroEnabled || isRevealed || !isReady) return;
-      const isFaceDown = (event.beta > 140 || event.beta < -140) && Math.abs(event.gamma) < 45;
-      if (isFaceDown && !isPlaying) startPlaying('gyro');
-      else if (!isFaceDown && isPlaying && playbackSourceRef.current === 'gyro') stopPlaying();
-    };
-    if (gyroEnabled) window.addEventListener('deviceorientation', handleOrientation);
-    return () => window.removeEventListener('deviceorientation', handleOrientation);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [gyroEnabled, isPlaying, isRevealed, isReady]);
 
   // ==========================================
   // VISTA DE IMPRESIÓN (PDF)
@@ -279,32 +258,47 @@ export default function HitsterApp() {
         </div>
       )}
 
-      {/* CÁMARA: vídeo visible, con proporción correcta y errores claros */}
-      {view === 'scanner' && (
-        <div className="w-full max-w-md flex flex-col items-center z-10">
-          <h2 className="text-2xl font-bold mb-4">Apunta al QR</h2>
-          <p className="text-gray-300 text-sm mb-3">Deberías ver la imagen de la cámara dentro de este recuadro.</p>
+      {/* La cámara conserva su instancia mientras esta pestaña está abierta.
+          Al salir de Escanear se oculta, pero no se vuelve a solicitar getUserMedia.
+          Permanece activa durante la sesión para evitar nuevos avisos del navegador. */}
+      {scannerInitialized && (
+        <div
+          aria-hidden={view !== 'scanner'}
+          className={view === 'scanner'
+            ? 'w-full max-w-md flex flex-col items-center z-10'
+            : 'fixed -left-[10000px] top-0 w-[320px] h-[320px] opacity-0 pointer-events-none overflow-hidden'
+          }
+        >
+          {view === 'scanner' && (
+            <>
+              <h2 className="text-2xl font-bold mb-4">Apunta al QR</h2>
+              <p className="text-gray-300 text-sm mb-3">Enfoca el código QR dentro del recuadro.</p>
+            </>
+          )}
           <div className="w-full aspect-square bg-gray-800 rounded-3xl overflow-hidden border-4 border-green-500 shadow-2xl relative">
             <QrReader
-              key="hitster-scanner"
               videoId="hitster-camera-video"
               onResult={handleScan}
-              constraints={{ facingMode: { ideal: 'environment' } }}
+              constraints={CAMERA_CONSTRAINTS}
               scanDelay={300}
-              containerStyle={{ width: '100%', height: '100%', position: 'absolute', inset: 0 }}
-              videoContainerStyle={{ width: '100%', height: '100%', paddingTop: 0, position: 'relative', overflow: 'hidden' }}
-              videoStyle={{ display: 'block', width: '100%', height: '100%', objectFit: 'cover', position: 'absolute', top: 0, left: 0 }}
+              containerStyle={CAMERA_CONTAINER_STYLE}
+              videoContainerStyle={CAMERA_VIDEO_CONTAINER_STYLE}
+              videoStyle={CAMERA_VIDEO_STYLE}
             />
-            <div className="pointer-events-none absolute inset-8 border-4 border-yellow-400 rounded-2xl z-20" />
+            {view === 'scanner' && (
+              <div className="pointer-events-none absolute inset-8 border-4 border-yellow-400 rounded-2xl z-20" />
+            )}
           </div>
-          {scannerError ? (
-            <div role="alert" className="w-full bg-red-900/80 border border-red-400 rounded-xl p-4 text-sm mt-4">
-              {scannerError}
-            </div>
-          ) : (
-            <p className="text-gray-300 text-sm mt-4">Si el navegador solicita permiso, selecciona «Permitir cámara».</p>
+          {view === 'scanner' && (
+            <>
+              {scannerError && (
+                <div role="alert" className="w-full bg-red-900/80 border border-red-400 rounded-xl p-4 text-sm mt-4">
+                  {scannerError}
+                </div>
+              )}
+              <button onClick={() => setView('menu')} className="mt-8 text-gray-400 hover:text-white underline font-medium">Volver al menú</button>
+            </>
           )}
-          <button onClick={() => setView('menu')} className="mt-8 text-gray-400 hover:text-white underline font-medium">Volver al menú</button>
         </div>
       )}
 
@@ -336,15 +330,11 @@ export default function HitsterApp() {
         </div>
       )}
 
-      {/* VISTA DEL REPRODUCTOR (Ya sin el botón bloqueado) */}
+      {/* El reproductor de YouTube se mantiene montado detrás de un fondo 100% opaco.
+          No usar display:none ni visibility:hidden: algunos navegadores bloquean el audio. */}
       {view === 'player' && currentSong && (
-        <div className="w-full max-w-md flex flex-col items-center justify-center bg-gray-800 p-8 rounded-3xl shadow-2xl relative overflow-hidden min-h-[500px] z-10">
-          {/* El reproductor sigue montado; normalmente permanece oculto para no revelar la respuesta.
-              En caso de bloqueo de autoplay se puede mostrar y utilizar los controles de YouTube. */}
-          <div
-            className={showYouTubePlayer ? 'relative w-full flex justify-center mb-5 z-40' : 'absolute top-0 left-0 pointer-events-none z-0'}
-            style={showYouTubePlayer ? {} : { width: 240, height: 200, opacity: 0.02 }}
-          >
+        <div className="w-full max-w-md relative isolate overflow-hidden rounded-3xl bg-gray-950 border border-gray-700 shadow-2xl min-h-[480px] z-10">
+          <div className="absolute top-0 left-0 z-0 pointer-events-none" aria-hidden="true" style={{ width: 240, height: 200 }}>
             <ReactPlayer
               ref={playerRef}
               src={`https://www.youtube.com/watch?v=${currentSong.youtubeId}`}
@@ -354,8 +344,8 @@ export default function HitsterApp() {
               onPlaying={handleActuallyPlaying}
               onPause={() => { if (playTimerRef.current) clearTimeout(playTimerRef.current); playTimerRef.current = null; setIsPlaying(false); }}
               onEnded={stopPlaying}
-              onError={() => { setPlayerError('YouTube no pudo reproducir este video. Prueba con otra canción o muestra el reproductor.'); stopPlaying(); }}
-              controls={true}
+              onError={() => { setPlayerError('No se pudo reproducir esta canción. Prueba otra tarjeta.'); stopPlaying(); }}
+              controls={false}
               width="240px"
               height="200px"
               playsInline={true}
@@ -365,51 +355,53 @@ export default function HitsterApp() {
             />
           </div>
 
-          {!isReady && !isRevealed ? (
-            <div className="absolute inset-0 z-50 bg-blue-600 flex flex-col items-center justify-center p-6 text-center animate-pulse">
-                <Smartphone size={80} className="text-white mb-6 animate-bounce" />
-                <h2 className="text-3xl font-black text-white mb-4 leading-tight">¡CANCION<br/>CARGADA!</h2>
-                <p className="text-blue-100 text-lg mb-10 font-medium">Toca el botón, luego presiona PLAY para escuchar la canción. También puedes girar el teléfono.</p>
-                
-                <button 
-                  onClick={handleReadyClick} 
-                  className="w-full py-8 font-black text-3xl rounded-3xl transition-all bg-yellow-400 hover:bg-yellow-500 text-black shadow-[0_10px_0_rgb(202,138,4)] active:translate-y-2 active:shadow-[0_0px_0_rgb(202,138,4)]"
-                >
-                  ¡ESTOY LISTO!
-                </button>
+          {/* Esta capa opaca impide que se vea cualquier imagen o título de YouTube. */}
+          <div className="absolute inset-0 z-10 bg-gray-950 pointer-events-none" aria-hidden="true" />
 
-                <button onClick={() => { setView('menu'); stopPlaying(); }} className="mt-8 text-sm text-blue-200 hover:text-white underline">Cancelar</button>
+          <div className="relative z-20 min-h-[480px] w-full flex flex-col items-center justify-center p-8">
+            <h2 className="text-xl text-gray-300 font-semibold mb-6 text-center">
+              {isRevealed ? 'Respuesta revelada' : 'Escucha y adivina la canción'}
+            </h2>
+            <div
+              className={`relative flex items-center justify-center w-48 h-48 rounded-full bg-black border-4 border-gray-700 shadow-[0_0_30px_rgba(0,0,0,0.5)] mb-6 transition-transform duration-1000 ${isPlaying ? 'animate-spin' : ''}`}
+              style={{ animationDuration: '3s' }}
+            >
+              <div className="absolute w-16 h-16 bg-yellow-500 rounded-full flex items-center justify-center">
+                <div className="w-4 h-4 bg-gray-900 rounded-full" />
+              </div>
             </div>
-          ) : (
-            <>
-              <h2 className="text-xl text-gray-400 font-medium mb-6">{isRevealed ? "Respuesta Revelada" : "Gira el teléfono o presiona Play"}</h2>
-              <div className={`relative flex items-center justify-center w-48 h-48 rounded-full bg-black border-4 border-gray-700 shadow-[0_0_30px_rgba(0,0,0,0.5)] mb-6 transition-transform duration-1000 ${isPlaying ? 'animate-spin' : ''}`} style={{ animationDuration: '3s' }}>
-                <div className="absolute w-16 h-16 bg-yellow-500 rounded-full flex items-center justify-center"><div className="w-4 h-4 bg-gray-900 rounded-full"></div></div>
-              </div>
-              <div className="flex gap-4 mb-3">
-                <button onClick={togglePlay} aria-label={isPlaying ? 'Pausar canción' : 'Reproducir canción'} className="w-20 h-20 bg-green-500 hover:bg-green-600 rounded-full flex items-center justify-center shadow-lg transform transition active:scale-95 z-40">
-                  {isPlaying ? <Pause size={36} className="text-white" /> : <Play size={36} className="text-white ml-2" />}
-                </button>
-              </div>
-              <p className="text-sm text-gray-300 mb-3 text-center">
-                {playerError || (playerReady ? 'Presiona PLAY para escuchar hasta 30 segundos.' : 'Cargando la canción de YouTube...')}
+            <button
+              onClick={togglePlay}
+              disabled={isRevealed}
+              aria-label={isPlaying ? 'Pausar canción' : 'Reproducir canción'}
+              className="w-20 h-20 bg-green-500 hover:bg-green-600 disabled:opacity-50 disabled:cursor-not-allowed rounded-full flex items-center justify-center shadow-lg transition active:scale-95 mb-4"
+            >
+              {isPlaying ? <Pause size={36} className="text-white" /> : <Play size={36} className="text-white ml-2" />}
+            </button>
+            {!isRevealed && (
+              <p className="text-sm text-gray-300 mb-6 text-center" role={playerError ? 'alert' : undefined}>
+                {playerError || (playerReady ? 'Presiona Play para escuchar 30 segundos.' : 'Cargando canción...')}
               </p>
-              <button onClick={() => setShowYouTubePlayer(v => !v)} className="text-xs text-blue-300 underline mb-6 z-40">
-                {showYouTubePlayer ? 'Ocultar reproductor de YouTube' : '¿No se escucha? Mostrar reproductor de YouTube (puede revelar pistas)'}
-              </button>
-              <div className={`w-full text-center transition-all duration-500 ${isRevealed ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-4 hidden'}`}>
+            )}
+            {isRevealed && (
+              <div className="w-full text-center mb-6">
                 <div className="text-6xl font-black text-yellow-400 mb-2 drop-shadow-lg">{currentSong.year}</div>
                 <h3 className="text-2xl font-bold text-white">{currentSong.title}</h3>
                 <p className="text-lg text-gray-300">{currentSong.artist}</p>
               </div>
-              {!isRevealed && (
-                <button onClick={() => { setIsRevealed(true); stopPlaying(); }} className="w-full py-4 bg-yellow-500 hover:bg-yellow-600 text-black font-black text-xl rounded-xl transition-colors flex items-center justify-center gap-2 z-40">
-                  <CheckCircle2 size={24} /> REVELAR RESPUESTA
-                </button>
-              )}
-              <button onClick={() => { setView('menu'); stopPlaying(); }} className="mt-8 text-sm text-gray-400 hover:text-white transition-colors z-40">Escanear otra tarjeta</button>
-            </>
-          )}
+            )}
+            {!isRevealed && (
+              <button
+                onClick={() => { setIsRevealed(true); stopPlaying(); }}
+                className="w-full py-4 bg-yellow-500 hover:bg-yellow-600 text-black font-black text-xl rounded-xl flex items-center justify-center gap-2"
+              >
+                <CheckCircle2 size={24} /> REVELAR RESPUESTA
+              </button>
+            )}
+            <button onClick={() => { setView('menu'); stopPlaying(); }} className="mt-8 text-sm text-gray-400 hover:text-white transition-colors">
+              Escanear otra tarjeta
+            </button>
+          </div>
         </div>
       )}
     </div>
