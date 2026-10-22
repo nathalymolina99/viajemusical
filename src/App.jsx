@@ -20,14 +20,36 @@ export default function HitsterApp() {
   
   const [isReady, setIsReady] = useState(false);
   const [gyroEnabled, setGyroEnabled] = useState(false);
+  const [scannerError, setScannerError] = useState('');
+  const [playerError, setPlayerError] = useState('');
+  const [playerReady, setPlayerReady] = useState(false);
+  const [showYouTubePlayer, setShowYouTubePlayer] = useState(false);
   
   const playerRef = useRef(null);
   const playTimerRef = useRef(null);
+  const songAlreadyScannedRef = useRef(false);
+  const didSeekRef = useRef(false);
+  const playbackSourceRef = useRef(null);
 
-  const extractYouTubeID = (url) => {
-    const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=)([^#&?]*).*/;
-    const match = url.match(regExp);
-    return (match && match[2].length === 11) ? match[2] : url;
+  // Admite URL normal, enlace corto, Shorts o un ID directo de YouTube.
+  const extractYouTubeID = (value) => {
+    const input = String(value || '').trim();
+    if (/^[a-zA-Z0-9_-]{11}$/.test(input)) return input;
+    try {
+      const url = new URL(/^https?:\/\//i.test(input) ? input : `https://${input}`);
+      const host = url.hostname.replace(/^www\./, '');
+      let id = '';
+      if (host === 'youtu.be') {
+        id = url.pathname.split('/')[1];
+      } else if (['youtube.com', 'm.youtube.com', 'music.youtube.com'].includes(host)) {
+        const segments = url.pathname.split('/').filter(Boolean);
+        id = segments[0] === 'watch' ? url.searchParams.get('v') :
+          ['shorts', 'embed', 'live'].includes(segments[0]) ? segments[1] : '';
+      }
+      return /^[a-zA-Z0-9_-]{11}$/.test(id || '') ? id : '';
+    } catch {
+      return '';
+    }
   };
 
   const generateId = () => Date.now().toString() + Math.random().toString(36).substring(2, 11);
@@ -35,8 +57,12 @@ export default function HitsterApp() {
   const handleCreateCard = (e) => {
     e.preventDefault();
     const videoId = extractYouTubeID(formData.youtubeId);
+    if (!videoId) {
+      alert('El enlace de YouTube no es válido. Comprueba el link antes de crear la tarjeta.');
+      return;
+    }
     const newCard = { ...formData, youtubeId: videoId, id: generateId() };
-    setCards([...cards, newCard]);
+    setCards(previous => [...previous, newCard]);
     setFormData({ title: '', artist: '', year: '', youtubeId: '' });
   };
 
@@ -58,74 +84,124 @@ export default function HitsterApp() {
         } else errors++;
       } else if (line.trim() !== '') errors++;
     });
-    setCards([...cards, ...newCards]);
+    setCards(previous => [...previous, ...newCards]);
     setBulkData('');
     alert(`¡Éxito! Se importaron ${newCards.length} tarjetas.\n${errors > 0 ? `Hubo ${errors} errores.` : ''}`);
   };
 
-  const handleScan = (result) => {
-    if (result) {
-      try {
-        const scannedData = JSON.parse(result?.text);
-        if (scannedData.youtubeId) {
-          setCurrentSong(scannedData);
-          setIsRevealed(false);
-          setIsPlaying(false);
-          setGyroEnabled(false);
-          setIsReady(false); 
-          setView('player');
-        }
-      } catch {
-        // Ignorar QRs inválidos
+  // Los errores habituales de lectura de QR no son fallos de la cámara.
+  // Aquí sí se muestran los errores de permiso, cámara no disponible o conexión insegura.
+  const handleScan = (result, error) => {
+    if (error) {
+      if (['NotAllowedError', 'PermissionDeniedError', 'SecurityError'].includes(error.name)) {
+        setScannerError('Permite el acceso a la cámara en la configuración de este sitio y vuelve a cargar la página.');
+      } else if (['NotFoundError', 'DevicesNotFoundError', 'OverconstrainedError'].includes(error.name)) {
+        setScannerError('No se encontró la cámara. Comprueba que esté conectada o prueba con otro navegador.');
+      } else if (['NotReadableError', 'TrackStartError'].includes(error.name)) {
+        setScannerError('La cámara está siendo utilizada por otra aplicación. Ciérrala y vuelve a intentarlo.');
+      } else if (error.message?.includes('MediaDevices') || error.name === 'TypeError') {
+        setScannerError('La cámara necesita una página HTTPS y los permisos del navegador.');
       }
     }
-  };
-
-  const handleDuration = (duration) => {
-    const maxStart = Math.max(0, duration - 30);
-    const randomStart = Math.floor(Math.random() * maxStart);
-    if (playerRef.current) playerRef.current.seekTo(randomStart, 'seconds');
-  };
-
-  const startPlaying = () => {
-    if (!isPlaying && !isRevealed) {
-      setIsPlaying(true);
-      if (playTimerRef.current) clearTimeout(playTimerRef.current);
-      playTimerRef.current = setTimeout(() => setIsPlaying(false), 30000); 
+    if (!result?.text || songAlreadyScannedRef.current) return;
+    try {
+      const scannedData = JSON.parse(result.text);
+      if (!scannedData.youtubeId || !/^[a-zA-Z0-9_-]{11}$/.test(scannedData.youtubeId)) {
+        setScannerError('El QR no contiene un enlace de YouTube válido para este juego.');
+        return;
+      }
+      songAlreadyScannedRef.current = true;
+      didSeekRef.current = false;
+      setScannerError('');
+      setCurrentSong(scannedData);
+      setIsRevealed(false);
+      setIsPlaying(false);
+      playbackSourceRef.current = null;
+      setGyroEnabled(false);
+      setIsReady(false);
+      setPlayerReady(false);
+      setPlayerError('');
+      setShowYouTubePlayer(false);
+      setView('player');
+    } catch {
+      setScannerError('El código escaneado no es una tarjeta de Hitster Pro.');
     }
+  };
+
+  // ReactPlayer 3 entrega la duración y expone currentTime (no seekTo).
+  // Se elige aleatoriamente un segmento de hasta 30 segundos.
+  const handleDurationChange = (reportedDuration) => {
+    if (didSeekRef.current) return;
+    const player = playerRef.current;
+    const duration = typeof reportedDuration === 'number'
+      ? reportedDuration : player?.duration;
+    if (!player || !Number.isFinite(duration) || duration <= 0) return;
+    didSeekRef.current = true;
+    const maxStart = Math.max(0, Math.floor(duration - 30));
+    if (maxStart > 0) {
+      player.currentTime = Math.floor(Math.random() * (maxStart + 1));
+    }
+  };
+
+  const startPlaying = (source = 'manual') => {
+    if (isRevealed) return;
+    playbackSourceRef.current = source;
+    setPlayerError('');
+    setIsPlaying(true);
   };
 
   const stopPlaying = () => {
+    playbackSourceRef.current = null;
     setIsPlaying(false);
     if (playTimerRef.current) clearTimeout(playTimerRef.current);
+    playTimerRef.current = null;
   };
 
-  const togglePlay = () => isPlaying ? stopPlaying() : startPlaying();
+  const togglePlay = () => isPlaying ? stopPlaying() : startPlaying('manual');
+
+  const handleActuallyPlaying = () => {
+    // El contador comienza cuando YouTube inicia el audio, no mientras carga.
+    setIsPlaying(true);
+    if (playTimerRef.current) clearTimeout(playTimerRef.current);
+    playTimerRef.current = setTimeout(() => {
+      playbackSourceRef.current = null;
+      setIsPlaying(false);
+    }, 30000);
+  };
+
+  useEffect(() => () => {
+    if (playTimerRef.current) clearTimeout(playTimerRef.current);
+  }, []);
 
   const handleReadyClick = () => {
     setIsReady(true);
-    
     if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
       DeviceOrientationEvent.requestPermission().then(state => {
-        if (state === 'granted') setGyroEnabled(true);
-      }).catch(console.error);
-    } else {
-      setGyroEnabled(true); 
+        setGyroEnabled(state === 'granted');
+      }).catch(() => setGyroEnabled(false));
+    } else if (typeof DeviceOrientationEvent !== 'undefined') {
+      setGyroEnabled(true);
     }
+    // No activar y detener el audio durante 500 ms: YouTube puede tardar en cargar.
+    // En el siguiente paso la persona pulsa PLAY, lo que ayuda a desbloquear sonido móvil.
+  };
 
-    // El truco para iOS: Usamos el tap del usuario para despertar el audio
-    setIsPlaying(true);
-    setTimeout(() => {
-      setIsPlaying(false);
-    }, 500);
+  const openScanner = () => {
+    songAlreadyScannedRef.current = false;
+    setScannerError(
+      typeof window !== 'undefined' && !window.isSecureContext
+        ? 'Abre el juego desde un sitio HTTPS (o localhost). En HTTP la cámara puede estar bloqueada.'
+        : ''
+    );
+    setView('scanner');
   };
 
   useEffect(() => {
     const handleOrientation = (event) => {
       if (!gyroEnabled || isRevealed || !isReady) return;
       const isFaceDown = (event.beta > 140 || event.beta < -140) && Math.abs(event.gamma) < 45;
-      if (isFaceDown && !isPlaying) startPlaying();
-      else if (!isFaceDown && isPlaying) stopPlaying();
+      if (isFaceDown && !isPlaying) startPlaying('gyro');
+      else if (!isFaceDown && isPlaying && playbackSourceRef.current === 'gyro') stopPlaying();
     };
     if (gyroEnabled) window.addEventListener('deviceorientation', handleOrientation);
     return () => window.removeEventListener('deviceorientation', handleOrientation);
@@ -184,22 +260,6 @@ export default function HitsterApp() {
   return (
     <div className="min-h-screen bg-gray-900 text-white font-sans flex flex-col items-center justify-center p-6 relative">
       
-      {/* REPRODUCTOR OCULTO DE YOUTUBE */}
-      {view === 'player' && currentSong && (
-        <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-0" style={{ opacity: 0.01 }}>
-          <ReactPlayer 
-            ref={playerRef} 
-            url={`https://www.youtube.com/watch?v=${currentSong.youtubeId}`} 
-            playing={isPlaying} 
-            onDuration={handleDuration} 
-            controls={false} 
-            width="200px" 
-            height="200px" 
-            playsinline={true}
-            config={{ youtube: { playerVars: { playsinline: 1 } } }}
-          />
-        </div>
-      )}
 
       <div className="w-full max-w-md text-center mb-8 z-10">
         <h1 className="text-4xl font-black tracking-wider text-yellow-400 drop-shadow-md cursor-pointer" onClick={() => { setView('menu'); stopPlaying(); }}>
@@ -210,7 +270,7 @@ export default function HitsterApp() {
 
       {view === 'menu' && (
         <div className="w-full max-w-md flex flex-col gap-4 z-10">
-          <button onClick={() => setView('scanner')} className="flex items-center justify-center gap-3 bg-green-500 hover:bg-green-600 text-white p-6 rounded-2xl text-xl font-bold shadow-lg">
+          <button onClick={openScanner} className="flex items-center justify-center gap-3 bg-green-500 hover:bg-green-600 text-white p-6 rounded-2xl text-xl font-bold shadow-lg">
             <Camera size={28} /> Escanear Tarjeta
           </button>
           <button onClick={() => setView('creator')} className="flex items-center justify-center gap-3 bg-gray-800 hover:bg-gray-700 text-white p-6 rounded-2xl text-xl font-bold border border-gray-700">
@@ -219,24 +279,31 @@ export default function HitsterApp() {
         </div>
       )}
 
-      {/* CÁMARA FIX: Forzando a que se vea por encima del fondo negro */}
+      {/* CÁMARA: vídeo visible, con proporción correcta y errores claros */}
       {view === 'scanner' && (
         <div className="w-full max-w-md flex flex-col items-center z-10">
           <h2 className="text-2xl font-bold mb-4">Apunta al QR</h2>
-          <div className="w-full aspect-square bg-gray-800 rounded-3xl overflow-hidden border-4 border-gray-700 shadow-2xl relative flex items-center justify-center">
-            <p className="absolute text-gray-500 text-center px-6 text-sm z-0">
-              Cargando cámara...
-            </p>
-            {/* Contenedor absoluto para forzar visibilidad en iOS */}
-            <div className="absolute inset-0 z-10" style={{ width: '100%', height: '100%' }}>
-              <QrReader 
-                onResult={handleScan} 
-                constraints={{ facingMode: 'environment' }} 
-                videoStyle={{ width: '100%', height: '100%', objectFit: 'cover' }}
-                containerStyle={{ width: '100%', height: '100%' }}
-              />
-            </div>
+          <p className="text-gray-300 text-sm mb-3">Deberías ver la imagen de la cámara dentro de este recuadro.</p>
+          <div className="w-full aspect-square bg-gray-800 rounded-3xl overflow-hidden border-4 border-green-500 shadow-2xl relative">
+            <QrReader
+              key="hitster-scanner"
+              videoId="hitster-camera-video"
+              onResult={handleScan}
+              constraints={{ facingMode: { ideal: 'environment' } }}
+              scanDelay={300}
+              containerStyle={{ width: '100%', height: '100%', position: 'absolute', inset: 0 }}
+              videoContainerStyle={{ width: '100%', height: '100%', paddingTop: 0, position: 'relative', overflow: 'hidden' }}
+              videoStyle={{ display: 'block', width: '100%', height: '100%', objectFit: 'cover', position: 'absolute', top: 0, left: 0 }}
+            />
+            <div className="pointer-events-none absolute inset-8 border-4 border-yellow-400 rounded-2xl z-20" />
           </div>
+          {scannerError ? (
+            <div role="alert" className="w-full bg-red-900/80 border border-red-400 rounded-xl p-4 text-sm mt-4">
+              {scannerError}
+            </div>
+          ) : (
+            <p className="text-gray-300 text-sm mt-4">Si el navegador solicita permiso, selecciona «Permitir cámara».</p>
+          )}
           <button onClick={() => setView('menu')} className="mt-8 text-gray-400 hover:text-white underline font-medium">Volver al menú</button>
         </div>
       )}
@@ -272,12 +339,37 @@ export default function HitsterApp() {
       {/* VISTA DEL REPRODUCTOR (Ya sin el botón bloqueado) */}
       {view === 'player' && currentSong && (
         <div className="w-full max-w-md flex flex-col items-center justify-center bg-gray-800 p-8 rounded-3xl shadow-2xl relative overflow-hidden min-h-[500px] z-10">
-          
+          {/* El reproductor sigue montado; normalmente permanece oculto para no revelar la respuesta.
+              En caso de bloqueo de autoplay se puede mostrar y utilizar los controles de YouTube. */}
+          <div
+            className={showYouTubePlayer ? 'relative w-full flex justify-center mb-5 z-40' : 'absolute top-0 left-0 pointer-events-none z-0'}
+            style={showYouTubePlayer ? {} : { width: 240, height: 200, opacity: 0.02 }}
+          >
+            <ReactPlayer
+              ref={playerRef}
+              src={`https://www.youtube.com/watch?v=${currentSong.youtubeId}`}
+              playing={isPlaying}
+              onReady={() => { setPlayerReady(true); setPlayerError(''); }}
+              onDurationChange={handleDurationChange}
+              onPlaying={handleActuallyPlaying}
+              onPause={() => { if (playTimerRef.current) clearTimeout(playTimerRef.current); playTimerRef.current = null; setIsPlaying(false); }}
+              onEnded={stopPlaying}
+              onError={() => { setPlayerError('YouTube no pudo reproducir este video. Prueba con otra canción o muestra el reproductor.'); stopPlaying(); }}
+              controls={true}
+              width="240px"
+              height="200px"
+              playsInline={true}
+              volume={1}
+              muted={false}
+              config={{ youtube: { playsinline: 1, rel: 0 } }}
+            />
+          </div>
+
           {!isReady && !isRevealed ? (
             <div className="absolute inset-0 z-50 bg-blue-600 flex flex-col items-center justify-center p-6 text-center animate-pulse">
                 <Smartphone size={80} className="text-white mb-6 animate-bounce" />
                 <h2 className="text-3xl font-black text-white mb-4 leading-tight">¡CANCION<br/>CARGADA!</h2>
-                <p className="text-blue-100 text-lg mb-10 font-medium">Toca el botón y pon tu teléfono boca abajo para empezar a jugar.</p>
+                <p className="text-blue-100 text-lg mb-10 font-medium">Toca el botón, luego presiona PLAY para escuchar la canción. También puedes girar el teléfono.</p>
                 
                 <button 
                   onClick={handleReadyClick} 
@@ -294,11 +386,17 @@ export default function HitsterApp() {
               <div className={`relative flex items-center justify-center w-48 h-48 rounded-full bg-black border-4 border-gray-700 shadow-[0_0_30px_rgba(0,0,0,0.5)] mb-6 transition-transform duration-1000 ${isPlaying ? 'animate-spin' : ''}`} style={{ animationDuration: '3s' }}>
                 <div className="absolute w-16 h-16 bg-yellow-500 rounded-full flex items-center justify-center"><div className="w-4 h-4 bg-gray-900 rounded-full"></div></div>
               </div>
-              <div className="flex gap-4 mb-8">
-                <button onClick={togglePlay} className="w-20 h-20 bg-green-500 hover:bg-green-600 rounded-full flex items-center justify-center shadow-lg transform transition active:scale-95 z-40">
+              <div className="flex gap-4 mb-3">
+                <button onClick={togglePlay} aria-label={isPlaying ? 'Pausar canción' : 'Reproducir canción'} className="w-20 h-20 bg-green-500 hover:bg-green-600 rounded-full flex items-center justify-center shadow-lg transform transition active:scale-95 z-40">
                   {isPlaying ? <Pause size={36} className="text-white" /> : <Play size={36} className="text-white ml-2" />}
                 </button>
               </div>
+              <p className="text-sm text-gray-300 mb-3 text-center">
+                {playerError || (playerReady ? 'Presiona PLAY para escuchar hasta 30 segundos.' : 'Cargando la canción de YouTube...')}
+              </p>
+              <button onClick={() => setShowYouTubePlayer(v => !v)} className="text-xs text-blue-300 underline mb-6 z-40">
+                {showYouTubePlayer ? 'Ocultar reproductor de YouTube' : '¿No se escucha? Mostrar reproductor de YouTube (puede revelar pistas)'}
+              </button>
               <div className={`w-full text-center transition-all duration-500 ${isRevealed ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-4 hidden'}`}>
                 <div className="text-6xl font-black text-yellow-400 mb-2 drop-shadow-lg">{currentSong.year}</div>
                 <h3 className="text-2xl font-bold text-white">{currentSong.title}</h3>
