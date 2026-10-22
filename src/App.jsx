@@ -381,11 +381,8 @@ export default function HitsterApp() {
           <button onClick={openScanner} className="flex items-center justify-center gap-3 bg-green-500 hover:bg-green-600 text-white p-6 rounded-2xl text-xl font-bold shadow-lg">
             <Camera size={28} /> Escanear Tarjeta
           </button>
-          <button onClick={() => { setCreatorMode('excel'); setView('creator'); }} className="flex items-center justify-center gap-3 bg-blue-600 hover:bg-blue-700 text-white p-6 rounded-2xl text-xl font-bold shadow-lg">
-            <PlusCircle size={28} /> IMPORTAR EXCEL Y DESCARGAR QRs
-          </button>
-          <button onClick={() => { setCreatorMode('single'); setView('creator'); }} className="flex items-center justify-center gap-3 bg-gray-800 hover:bg-gray-700 text-white p-5 rounded-2xl text-lg font-bold border border-gray-700">
-            <PlusCircle size={26} /> Crear un QR individual
+          <button onClick={() => { setCreatorMode('single'); setView('creator'); }} className="flex items-center justify-center gap-3 bg-gray-800 hover:bg-gray-700 text-white p-6 rounded-2xl text-xl font-bold border border-gray-700 shadow-lg">
+            <PlusCircle size={28} /> Crear códigos QR
           </button>
         </div>
       )}
@@ -449,7 +446,7 @@ export default function HitsterApp() {
             </button>
             <button type="button" disabled={bulkBusy} onClick={() => setCreatorMode('excel')}
               className={`flex-1 rounded-xl p-3 font-bold ${creatorMode === 'excel' ? 'bg-yellow-500 text-black' : 'bg-gray-700 text-white'}`}>
-              Desde Excel (masivo)
+              Desde Excel
             </button>
           </div>
           {creatorMode === 'single' ? (
