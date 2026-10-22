@@ -1,488 +1,272 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
+import ReactPlayer from 'react-player';
 import { QRCodeCanvas } from 'qrcode.react';
 import { QrReader } from 'react-qr-reader';
-import { Camera, CheckCircle2, Download, Pause, Play, PlusCircle } from 'lucide-react';
+import { Play, Pause, Camera, PlusCircle, CheckCircle2, Download } from 'lucide-react';
 
-const FRAGMENT_SECONDS = 30;
+// Mantener las opciones estables evita reiniciar el lector en cada cambio de pantalla.
 const CAMERA_CONSTRAINTS = { facingMode: { ideal: 'environment' } };
-const CAMERA_STYLE = { width: '100%', height: '100%', position: 'absolute', inset: 0 };
-const VIDEO_CONTAINER_STYLE = { width: '100%', height: '100%', paddingTop: 0, position: 'relative', overflow: 'hidden' };
-const VIDEO_STYLE = { width: '100%', height: '100%', objectFit: 'cover', position: 'absolute', inset: 0 };
-
-function validMp3Link(value) {
-  try {
-    const url = new URL(String(value || '').trim());
-    return url.protocol === 'https:' || (url.protocol === 'http:' && url.hostname === 'localhost');
-  } catch {
-    return false;
-  }
-}
-
-function chooseRandomStart(duration, previous) {
-  if (!Number.isFinite(duration) || duration <= FRAGMENT_SECONDS) return 0;
-  const margin = duration >= 60 ? 10 : 0;
-  const min = margin;
-  const max = Math.max(min, Math.floor(duration - FRAGMENT_SECONDS - margin));
-  if (max === min) return min;
-  const minimumDifference = Math.min(15, Math.max(1, Math.floor((max - min) / 3)));
-  for (let attempt = 0; attempt < 35; attempt += 1) {
-    const start = min + Math.floor(Math.random() * (max - min + 1));
-    if (!Number.isFinite(previous) || Math.abs(previous - start) >= minimumDifference) return start;
-  }
-  return Math.abs(previous - min) > Math.abs(previous - max) ? min : max;
-}
-
-function safeFileName(value) {
-  return String(value || 'cancion')
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 50);
-}
-
-function silentWavUrl() {
-  const frames = 1600;
-  const bytes = new Uint8Array(44 + frames);
-  const view = new DataView(bytes.buffer);
-  const write = (offset, value) => {
-    for (let index = 0; index < value.length; index += 1) bytes[offset + index] = value.charCodeAt(index);
-  };
-  write(0, 'RIFF'); view.setUint32(4, 36 + frames, true);
-  write(8, 'WAVE'); write(12, 'fmt '); view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true); view.setUint16(22, 1, true);
-  view.setUint32(24, 8000, true); view.setUint32(28, 8000, true);
-  view.setUint16(32, 1, true); view.setUint16(34, 8, true);
-  write(36, 'data'); view.setUint32(40, frames, true);
-  bytes.fill(128, 44);
-  return URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
-}
+const CAMERA_CONTAINER_STYLE = { width: '100%', height: '100%', position: 'absolute', inset: 0 };
+const CAMERA_VIDEO_CONTAINER_STYLE = { width: '100%', height: '100%', paddingTop: 0, position: 'relative', overflow: 'hidden' };
+const CAMERA_VIDEO_STYLE = { display: 'block', width: '100%', height: '100%', objectFit: 'cover', position: 'absolute', top: 0, left: 0 };
 
 export default function HitsterApp() {
-  const [view, setView] = useState('menu');
-  const [form, setForm] = useState({ year: '', artist: '', title: '', audioUrl: '' });
+  const [view, setView] = useState('menu'); 
+  const [formData, setFormData] = useState({ title: '', artist: '', year: '', youtubeId: '' });
+  // Se guarda una sola canción generada; no se fabrican tarjetas ni PDFs.
   const [qrSong, setQrSong] = useState(null);
   const [qrError, setQrError] = useState('');
+  const qrCanvasRef = useRef(null);
 
+  const [currentSong, setCurrentSong] = useState(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isRevealed, setIsRevealed] = useState(false);
+  
+  // El lector se monta solo la primera vez, y no se desmonta entre tarjetas.
   const [scannerInitialized, setScannerInitialized] = useState(false);
   const [scannerError, setScannerError] = useState('');
-  const [motionAllowed, setMotionAllowed] = useState(false);
-  const [motionMessage, setMotionMessage] = useState('');
-  const [currentSong, setCurrentSong] = useState(null);
-  const [isPrepared, setIsPrepared] = useState(false);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [isFinished, setIsFinished] = useState(false);
-  const [isRevealed, setIsRevealed] = useState(false);
-  const [audioError, setAudioError] = useState('');
-
-  const audioRef = useRef(null);
-  const qrCanvasRef = useRef(null);
+  const [playerError, setPlayerError] = useState('');
+  const [playerReady, setPlayerReady] = useState(false);
+  
+  const playerRef = useRef(null);
+  const playTimerRef = useRef(null);
+  const songAlreadyScannedRef = useRef(false);
+  const didSeekRef = useRef(false);
   const viewRef = useRef(view);
-  const songRef = useRef(null);
-  const scannerBusyRef = useRef(false);
-  const motionRequestedRef = useRef(false);
-  const motionAllowedRef = useRef(false);
-  const motionSamplesSeenRef = useRef(false);
-  const downSinceRef = useRef(null);
-  const autoTriggeredRef = useRef(false);
-  const unlockAttemptedRef = useRef(false);
-  const silenceUrlRef = useRef(null);
-  const lastStartRef = useRef({});
-  const lastRenderedUrlRef = useRef(null);
 
-  const preparedRef = useRef(false);
-  const segmentChosenRef = useRef(false);
-  const seekPendingRef = useRef(false);
-  const desiredStartRef = useRef(0);
-  const segmentEndRef = useRef(0);
-  const startedRef = useRef(false);
-  const playPendingRef = useRef(false);
-  const playingRef = useRef(false);
-  const finishedRef = useRef(false);
-  const revealedRef = useRef(false);
-  const endIntervalRef = useRef(null);
-
-  useEffect(() => { viewRef.current = view; }, [view]);
-
+  // Sincronizar el ref después del render (react-hooks/refs).
   useEffect(() => {
-    if (!currentSong || !audioRef.current) return;
-    const repeated = lastRenderedUrlRef.current === currentSong.audioUrl;
-    lastRenderedUrlRef.current = currentSong.audioUrl;
-    if (repeated) audioRef.current.load();
-  }, [currentSong]);
+    viewRef.current = view;
+  }, [view]);
 
-  const isActiveTrack = useCallback(() => {
-    const song = songRef.current;
-    const activeSrc = audioRef.current?.currentSrc;
-    if (!song || !activeSrc) return false;
+  // Admite URL normal, enlace corto, Shorts o un ID directo de YouTube.
+  const extractYouTubeID = (value) => {
+    const input = String(value || '').trim();
+    if (/^[a-zA-Z0-9_-]{11}$/.test(input)) return input;
     try {
-      return new URL(activeSrc, window.location.href).href === new URL(song.audioUrl, window.location.href).href;
-    } catch {
-      return false;
-    }
-  }, []);
-
-  const clearEndTimer = useCallback(() => {
-    if (endIntervalRef.current !== null) window.clearInterval(endIntervalRef.current);
-    endIntervalRef.current = null;
-  }, []);
-
-  const pauseSong = useCallback(() => {
-    clearEndTimer();
-    if (audioRef.current) audioRef.current.pause();
-    playingRef.current = false;
-    playPendingRef.current = false;
-    setIsPlaying(false);
-  }, [clearEndTimer]);
-
-  const finishFragment = useCallback(() => {
-    if (!isActiveTrack() || !startedRef.current || seekPendingRef.current || finishedRef.current) return;
-    const audio = audioRef.current;
-    if (audio) audio.pause();
-    clearEndTimer();
-    playingRef.current = false;
-    playPendingRef.current = false;
-    finishedRef.current = true;
-    setIsPlaying(false);
-    setIsFinished(true);
-  }, [clearEndTimer, isActiveTrack]);
-
-  const checkEnd = useCallback(() => {
-    const audio = audioRef.current;
-    if (!audio || !isActiveTrack() || !startedRef.current || !playingRef.current || seekPendingRef.current) return;
-    const elapsed = audio.currentTime - desiredStartRef.current;
-    if (Number.isFinite(elapsed) && elapsed >= FRAGMENT_SECONDS - 0.07) finishFragment();
-  }, [finishFragment, isActiveTrack]);
-
-  const prepareRandomSegment = useCallback(() => {
-    const audio = audioRef.current;
-    const song = songRef.current;
-    if (!audio || !song || !isActiveTrack() || segmentChosenRef.current) return;
-    const duration = audio.duration;
-    if (!Number.isFinite(duration) || duration <= 0) return;
-
-    const start = chooseRandomStart(duration, lastStartRef.current[song.audioUrl]);
-    lastStartRef.current[song.audioUrl] = start;
-    desiredStartRef.current = start;
-    segmentEndRef.current = Math.min(duration, start + FRAGMENT_SECONDS);
-    segmentChosenRef.current = true;
-    
-    // CORRECCIÓN: Se marca como preparado inmediatamente, desbloqueando la interfaz y sensores.
-    preparedRef.current = true;
-    seekPendingRef.current = false;
-    setIsPrepared(true);
-
-    try {
-      audio.currentTime = start;
-    } catch {
-      // Ignoramos silenciosamente si Safari lo bloquea aquí
-    }
-  }, [isActiveTrack]);
-
-  const playSong = useCallback(() => {
-    const audio = audioRef.current;
-    if (!audio || !isActiveTrack() || revealedRef.current || finishedRef.current) return;
-    if (playPendingRef.current || playingRef.current) return;
-    
-    playPendingRef.current = true;
-    setAudioError('');
-    
-    // CORRECCIÓN: Forzamos el salto de tiempo en el instante en que el navegador autoriza el inicio
-    if (Math.abs(audio.currentTime - desiredStartRef.current) > 1.5) {
-        try { audio.currentTime = desiredStartRef.current; } catch {
-  // eslint-disable-next-line no-empty
-}
-    }
-
-    try {
-      const promise = audio.play();
-      if (promise && typeof promise.catch === 'function') {
-        void promise.catch((error) => {
-          playPendingRef.current = false;
-          if (error?.name === 'AbortError') return;
-          setAudioError(error?.name === 'NotAllowedError'
-            ? 'Safari bloqueó el inicio por giro. Toca Play una vez para escuchar esta canción.'
-            : 'No se pudo reproducir el MP3. Revisa el enlace y el formato del archivo.');
-        });
+      const url = new URL(/^https?:\/\//i.test(input) ? input : `https://${input}`);
+      const host = url.hostname.replace(/^www\./, '');
+      let id = '';
+      if (host === 'youtu.be') {
+        id = url.pathname.split('/')[1];
+      } else if (['youtube.com', 'm.youtube.com', 'music.youtube.com'].includes(host)) {
+        const segments = url.pathname.split('/').filter(Boolean);
+        id = segments[0] === 'watch' ? url.searchParams.get('v') :
+          ['shorts', 'embed', 'live'].includes(segments[0]) ? segments[1] : '';
       }
+      return /^[a-zA-Z0-9_-]{11}$/.test(id || '') ? id : '';
     } catch {
-      playPendingRef.current = false;
-      setAudioError('No se pudo iniciar el MP3. Prueba con el botón Play.');
-    }
-  }, [isActiveTrack]);
-
-  const onAudioPlaying = () => {
-    if (!isActiveTrack() || seekPendingRef.current || finishedRef.current) return;
-    startedRef.current = true;
-    playPendingRef.current = false;
-    playingRef.current = true;
-    setIsPlaying(true);
-    setAudioError('');
-    clearEndTimer();
-    endIntervalRef.current = window.setInterval(checkEnd, 200);
-  };
-
-  const loadSong = useCallback((song) => {
-    pauseSong();
-    songRef.current = song;
-    preparedRef.current = false;
-    segmentChosenRef.current = false;
-    seekPendingRef.current = false;
-    desiredStartRef.current = 0;
-    segmentEndRef.current = 0;
-    startedRef.current = false;
-    finishedRef.current = false;
-    revealedRef.current = false;
-    autoTriggeredRef.current = false;
-    downSinceRef.current = null;
-    setCurrentSong(song);
-    setIsPrepared(false);
-    setIsPlaying(false);
-    setIsFinished(false);
-    setIsRevealed(false);
-    setAudioError('');
-    setView('player');
-    viewRef.current = 'player';
-  }, [pauseSong]);
-
-  const handleScan = useCallback((result, error) => {
-    if (viewRef.current !== 'scanner') return;
-    if (error && ['NotAllowedError', 'PermissionDeniedError', 'SecurityError'].includes(error.name)) {
-      setScannerError('Permite el uso de la cámara en Safari y abre la web mediante HTTPS.');
-    } else if (error && ['NotFoundError', 'OverconstrainedError'].includes(error.name)) {
-      setScannerError('No se encontró una cámara disponible.');
-    }
-    if (!result?.text || scannerBusyRef.current) return;
-    try {
-      const parsed = JSON.parse(result.text);
-      const audioUrl = String(parsed.audioUrl || parsed.mp3Url || '').trim();
-      if (!validMp3Link(audioUrl)) {
-        setScannerError(parsed.youtubeId
-          ? 'Este QR utiliza YouTube. Crea un QR nuevo con el archivo MP3.'
-          : 'El QR no contiene un enlace HTTPS válido a un MP3.');
-        return;
-      }
-      scannerBusyRef.current = true;
-      setScannerError('');
-      loadSong({
-        audioUrl,
-        title: String(parsed.title || ''),
-        artist: String(parsed.artist || ''),
-        year: String(parsed.year || ''),
-      });
-    } catch {
-      setScannerError('Este código no tiene el formato QR de Hitster Pro.');
-    }
-  }, [loadSong]);
-
-  const authorizeMotionFromClick = () => {
-    if (motionRequestedRef.current) return;
-    motionRequestedRef.current = true;
-    if (!('DeviceMotionEvent' in window) && !('DeviceOrientationEvent' in window)) {
-      setMotionMessage('Este dispositivo no tiene sensores de giro. Usa Play.');
-      return;
-    }
-    try {
-      const requests = [];
-      if (typeof window.DeviceMotionEvent?.requestPermission === 'function') {
-        requests.push(window.DeviceMotionEvent.requestPermission());
-      }
-      if (typeof window.DeviceOrientationEvent?.requestPermission === 'function') {
-        requests.push(window.DeviceOrientationEvent.requestPermission());
-      }
-      if (requests.length === 0) {
-        motionAllowedRef.current = true;
-        setMotionAllowed(true);
-        setMotionMessage('Detección del giro habilitada.');
-      } else {
-        void Promise.all(requests).then((answers) => {
-          const granted = answers.some((answer) => answer === 'granted');
-          motionAllowedRef.current = granted;
-          setMotionAllowed(granted);
-          setMotionMessage(granted
-            ? 'Giro autorizado. Coloca el teléfono boca abajo para intentar reproducir.'
-            : 'Safari no autorizó los sensores. Puedes usar Play.');
-        }).catch(() => {
-          setMotionMessage('No se pudo autorizar el giro. Puedes usar Play.');
-        });
-      }
-    } catch {
-      setMotionMessage('No se pudo solicitar el permiso del sensor. Puedes usar Play.');
+      return '';
     }
   };
 
-  const warmUpAudioFromClick = () => {
-    if (unlockAttemptedRef.current || songRef.current || !audioRef.current) return;
-    unlockAttemptedRef.current = true;
-    try {
-      const url = silentWavUrl();
-      silenceUrlRef.current = url;
-      audioRef.current.src = url;
-      const promise = audioRef.current.play();
-      if (promise && typeof promise.catch === 'function') void promise.catch(() => {});
-    } catch {
-      // Ignorado para limpiar las advertencias de ESLint
-    }
-  };
-
-  const openScanner = () => {
-    pauseSong();
-    if (!motionRequestedRef.current) authorizeMotionFromClick();
-    warmUpAudioFromClick();
-    scannerBusyRef.current = false;
-    setScannerInitialized(true);
-    setScannerError(window.isSecureContext ? '' : 'El escáner necesita HTTPS o localhost.');
-    setView('scanner');
-    viewRef.current = 'scanner';
-  };
-
-  useEffect(() => {
-    if (!motionAllowed) return undefined;
-    const acceptFaceDown = (isDown) => {
-      if (viewRef.current !== 'player' || !songRef.current || revealedRef.current
-        || finishedRef.current || autoTriggeredRef.current || playingRef.current) {
-        downSinceRef.current = null;
-        return;
-      }
-      if (!isDown) {
-        downSinceRef.current = null;
-        return;
-      }
-      const now = Date.now();
-      if (downSinceRef.current === null) {
-        downSinceRef.current = now;
-      } else if (now - downSinceRef.current >= 250 && preparedRef.current) {
-        autoTriggeredRef.current = true;
-        downSinceRef.current = null;
-        playSong();
-      }
-    };
-    const onMotion = (event) => {
-      const z = event.accelerationIncludingGravity?.z;
-      if (!Number.isFinite(z)) return;
-      motionSamplesSeenRef.current = true;
-      acceptFaceDown(z < -6.2);
-    };
-    const onOrientation = (event) => {
-      if (motionSamplesSeenRef.current) return;
-      const beta = event.beta;
-      const gamma = event.gamma;
-      acceptFaceDown(Number.isFinite(beta) && Number.isFinite(gamma)
-        && Math.abs(beta) > 145 && Math.abs(gamma) < 50);
-    };
-    window.addEventListener('devicemotion', onMotion);
-    window.addEventListener('deviceorientation', onOrientation);
-    return () => {
-      window.removeEventListener('devicemotion', onMotion);
-      window.removeEventListener('deviceorientation', onOrientation);
-    };
-  }, [motionAllowed, playSong]);
-
-  useEffect(() => () => {
-    clearEndTimer();
-    if (silenceUrlRef.current) URL.revokeObjectURL(silenceUrlRef.current);
-  }, [clearEndTimer]);
-
-  const goMenu = () => { pauseSong(); setView('menu'); viewRef.current = 'menu'; };
-  const reveal = () => {
-    pauseSong();
-    revealedRef.current = true;
-    setIsRevealed(true);
-  };
-
-  const generateQR = (event) => {
+  // Genera el QR con los datos que el escáner existente necesita.
+  const handleGenerateQR = (event) => {
     event.preventDefault();
-    if (!validMp3Link(form.audioUrl)) {
-      setQrError('Ingresa el enlace HTTPS directo al MP3 de Cloudflare R2.');
+    const youtubeId = extractYouTubeID(formData.youtubeId);
+    if (!youtubeId) {
+      setQrError('El enlace de YouTube no es válido. Revisa el link e inténtalo otra vez.');
       setQrSong(null);
       return;
     }
     setQrError('');
-    setQrSong({ year: form.year.trim(), artist: form.artist.trim(), title: form.title.trim(), audioUrl: form.audioUrl.trim() });
+    setQrSong({
+      year: String(formData.year).trim(),
+      artist: formData.artist.trim(),
+      title: formData.title.trim(),
+      youtubeId,
+    });
   };
 
-  const downloadQR = () => {
+  // Guarda un PNG con fondo blanco, margen y resolución alta para diseñar tarjetas.
+  const handleDownloadQR = () => {
     if (!qrSong || !qrCanvasRef.current) return;
     try {
-      const png = qrCanvasRef.current.toDataURL('image/png');
-      const a = document.createElement('a');
-      a.href = png;
-      a.download = `QR_${safeFileName(qrSong.artist)}_${safeFileName(qrSong.title)}.png`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+      const canvas = qrCanvasRef.current;
+      const png = canvas.toDataURL('image/png');
+      const clean = (value) => String(value)
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-zA-Z0-9_-]+/g, '_')
+        .replace(/^_+|_+$/g, '').slice(0, 45);
+      const filename = `QR_${clean(qrSong.artist)}_${clean(qrSong.title)}.png`;
+      const link = document.createElement('a');
+      link.href = png;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
     } catch {
-      setQrError('No fue posible descargar el QR. Prueba otro navegador.');
+      setQrError('No se pudo descargar la imagen. Prueba desde Chrome o Safari.');
     }
   };
 
+  const handleNewQR = () => {
+    setFormData({ title: '', artist: '', year: '', youtubeId: '' });
+    setQrSong(null);
+    setQrError('');
+  };
+
+  const updateField = (key, value) => {
+    setFormData((previous) => ({ ...previous, [key]: value }));
+    // Evita descargar por accidente un QR que corresponda a datos anteriores.
+    setQrSong(null);
+    setQrError('');
+  };
+
+  // Un único lector para toda la sesión: no se desmonta al abrir una canción.
+  // El navegador decide si recuerda el permiso entre visitas o recargas.
+  const handleScan = useCallback((result, error) => {
+    if (viewRef.current !== 'scanner') return;
+    if (error) {
+      if (['NotAllowedError', 'PermissionDeniedError', 'SecurityError'].includes(error.name)) {
+        setScannerError('Autoriza la cámara en los permisos de este sitio. Para que el navegador lo recuerde, selecciona «Permitir» de forma permanente si aparece esa opción.');
+      } else if (['NotFoundError', 'DevicesNotFoundError', 'OverconstrainedError'].includes(error.name)) {
+        setScannerError('No se encontró la cámara. Comprueba que esté conectada o prueba con otro navegador.');
+      } else if (['NotReadableError', 'TrackStartError'].includes(error.name)) {
+        setScannerError('La cámara está siendo utilizada por otra aplicación. Ciérrala y vuelve a intentarlo.');
+      } else if (error.message?.includes('MediaDevices') || error.name === 'TypeError') {
+        setScannerError('La cámara necesita una página HTTPS y los permisos del navegador.');
+      }
+    }
+    if (!result?.text || songAlreadyScannedRef.current) return;
+    try {
+      const scannedData = JSON.parse(result.text);
+      if (!scannedData.youtubeId || !/^[a-zA-Z0-9_-]{11}$/.test(scannedData.youtubeId)) {
+        setScannerError('El QR no contiene un enlace de YouTube válido para este juego.');
+        return;
+      }
+      songAlreadyScannedRef.current = true;
+      didSeekRef.current = false;
+      setScannerError('');
+      setCurrentSong(scannedData);
+      setIsRevealed(false);
+      setIsPlaying(false);
+      setPlayerReady(false);
+      setPlayerError('');
+      setView('player');
+      viewRef.current = 'player';
+    } catch {
+      setScannerError('El código escaneado no es una tarjeta de Hitster Pro.');
+    }
+  }, []);
+
+  // ReactPlayer 3 entrega la duración y expone currentTime (no seekTo).
+  // Se elige aleatoriamente un segmento de hasta 30 segundos.
+  const handleDurationChange = (reportedDuration) => {
+    if (didSeekRef.current) return;
+    const player = playerRef.current;
+    const duration = typeof reportedDuration === 'number'
+      ? reportedDuration : player?.duration;
+    if (!player || !Number.isFinite(duration) || duration <= 0) return;
+    didSeekRef.current = true;
+    const maxStart = Math.max(0, Math.floor(duration - 30));
+    if (maxStart > 0) {
+      player.currentTime = Math.floor(Math.random() * (maxStart + 1));
+    }
+  };
+
+  const startPlaying = () => {
+    if (isRevealed) return;
+    setPlayerError('');
+    setIsPlaying(true);
+  };
+
+  const stopPlaying = () => {
+    setIsPlaying(false);
+    if (playTimerRef.current) clearTimeout(playTimerRef.current);
+    playTimerRef.current = null;
+  };
+
+  const togglePlay = () => isPlaying ? stopPlaying() : startPlaying();
+
+  const handleActuallyPlaying = () => {
+    // El contador comienza cuando YouTube inicia el audio, no mientras carga.
+    setIsPlaying(true);
+    if (playTimerRef.current) clearTimeout(playTimerRef.current);
+    playTimerRef.current = setTimeout(() => {
+      setIsPlaying(false);
+    }, 30000);
+  };
+
+  useEffect(() => () => {
+    if (playTimerRef.current) clearTimeout(playTimerRef.current);
+  }, []);
+
+  const openScanner = () => {
+    songAlreadyScannedRef.current = false;
+    setScannerInitialized(true);
+    setScannerError(
+      typeof window !== 'undefined' && !window.isSecureContext
+        ? 'Abre el juego desde un sitio HTTPS (o localhost). En HTTP la cámara puede estar bloqueada.'
+        : ''
+    );
+    setView('scanner');
+  };
+
+  // ==========================================
+  // VISTA PRINCIPAL
+  // ==========================================
   return (
     <div className="min-h-screen bg-gray-900 text-white font-sans flex flex-col items-center justify-center p-6 relative">
-      {/* CORRECCIÓN: Agregado crossOrigin="anonymous" y quitados los eventos de búsqueda problemáticos */}
-      <audio
-        ref={audioRef}
-        src={currentSong?.audioUrl || undefined}
-        preload="auto"
-        playsInline
-        crossOrigin="anonymous"
-        onLoadedMetadata={prepareRandomSegment}
-        onDurationChange={prepareRandomSegment}
-        onPlaying={onAudioPlaying}
-        onPause={() => { clearEndTimer(); playingRef.current = false; setIsPlaying(false); }}
-        onTimeUpdate={checkEnd}
-        onEnded={() => {
-          if (!isActiveTrack() || !startedRef.current || seekPendingRef.current) return;
-          finishFragment();
-        }}
-        onError={() => {
-          if (!isActiveTrack()) return;
-          pauseSong();
-          preparedRef.current = false;
-          setIsPrepared(false);
-          setAudioError('El MP3 no se pudo cargar. Comprueba que el enlace de R2 abra el archivo directamente.');
-        }}
-      />
+      
 
       <div className="w-full max-w-md text-center mb-8 z-10">
-        <button onClick={goMenu} className="text-4xl font-black tracking-wider text-yellow-400">
+        <h1 className="text-4xl font-black tracking-wider text-yellow-400 drop-shadow-md cursor-pointer" onClick={() => { setView('menu'); stopPlaying(); }}>
           HITSTER <span className="text-white text-xl">PRO</span>
-        </button>
+        </h1>
         <p className="text-gray-400 text-sm mt-2">Tu juego musical familiar</p>
       </div>
 
       {view === 'menu' && (
         <div className="w-full max-w-md flex flex-col gap-4 z-10">
-          <button onClick={openScanner} className="flex items-center justify-center gap-3 bg-green-500 hover:bg-green-600 p-6 rounded-2xl text-xl font-bold shadow-lg">
-            <Camera size={28} /> Escanear tarjeta
+          <button onClick={openScanner} className="flex items-center justify-center gap-3 bg-green-500 hover:bg-green-600 text-white p-6 rounded-2xl text-xl font-bold shadow-lg">
+            <Camera size={28} /> Escanear Tarjeta
           </button>
-          <button onClick={() => setView('creator')} className="flex items-center justify-center gap-3 bg-gray-800 hover:bg-gray-700 p-6 rounded-2xl text-xl font-bold border border-gray-700">
-            <PlusCircle size={28} /> Crear código QR MP3
+          <button onClick={() => setView('creator')} className="flex items-center justify-center gap-3 bg-gray-800 hover:bg-gray-700 text-white p-6 rounded-2xl text-xl font-bold border border-gray-700">
+            <PlusCircle size={28} /> Crear código QR
           </button>
-          {motionMessage && <p className="text-center text-gray-400 text-sm">{motionMessage}</p>}
         </div>
       )}
 
+      {/* La cámara conserva su instancia mientras esta pestaña está abierta.
+          Al salir de Escanear se oculta, pero no se vuelve a solicitar getUserMedia.
+          Permanece activa durante la sesión para evitar nuevos avisos del navegador. */}
       {scannerInitialized && (
         <div
           aria-hidden={view !== 'scanner'}
           className={view === 'scanner'
             ? 'w-full max-w-md flex flex-col items-center z-10'
-            : 'fixed left-[-10000px] top-0 w-80 h-80 opacity-0 pointer-events-none overflow-hidden'}
+            : 'fixed left-[-10000px] top-0 w-80 h-80 opacity-0 pointer-events-none overflow-hidden'
+          }
         >
-          {view === 'scanner' && <h2 className="text-2xl font-bold mb-4">Apunta al código QR</h2>}
+          {view === 'scanner' && (
+            <>
+              <h2 className="text-2xl font-bold mb-4">Apunta al QR</h2>
+              <p className="text-gray-300 text-sm mb-3">Enfoca el código QR dentro del recuadro.</p>
+            </>
+          )}
           <div className="w-full aspect-square bg-gray-800 rounded-3xl overflow-hidden border-4 border-green-500 shadow-2xl relative">
             <QrReader
               videoId="hitster-camera-video"
-              constraints={CAMERA_CONSTRAINTS}
               onResult={handleScan}
+              constraints={CAMERA_CONSTRAINTS}
               scanDelay={300}
-              containerStyle={CAMERA_STYLE}
-              videoContainerStyle={VIDEO_CONTAINER_STYLE}
-              videoStyle={VIDEO_STYLE}
+              containerStyle={CAMERA_CONTAINER_STYLE}
+              videoContainerStyle={CAMERA_VIDEO_CONTAINER_STYLE}
+              videoStyle={CAMERA_VIDEO_STYLE}
             />
-            {view === 'scanner' && <div className="pointer-events-none absolute inset-8 border-4 border-yellow-400 rounded-2xl z-20" />}
+            {view === 'scanner' && (
+              <div className="pointer-events-none absolute inset-8 border-4 border-yellow-400 rounded-2xl z-20" />
+            )}
           </div>
           {view === 'scanner' && (
             <>
-              {scannerError && <p role="alert" className="mt-4 p-3 rounded-xl bg-red-950 text-red-200 w-full">{scannerError}</p>}
-              <button onClick={goMenu} className="mt-8 text-gray-300 underline">Volver al menú</button>
+              {scannerError && (
+                <div role="alert" className="w-full bg-red-900/80 border border-red-400 rounded-xl p-4 text-sm mt-4">
+                  {scannerError}
+                </div>
+              )}
+              <button onClick={() => setView('menu')} className="mt-8 text-gray-400 hover:text-white underline font-medium">Volver al menú</button>
             </>
           )}
         </div>
@@ -490,110 +274,148 @@ export default function HitsterApp() {
 
       {view === 'creator' && (
         <div className="w-full max-w-md bg-gray-800 p-6 rounded-2xl shadow-xl z-10">
-          <h2 className="text-2xl font-black text-yellow-400 text-center mb-3">Generar código QR MP3</h2>
-          <p className="text-sm text-gray-300 text-center mb-6">Solo el QR en PNG, para que diseñes tus propias tarjetas.</p>
-          <form onSubmit={generateQR} className="flex flex-col gap-4">
-            {[
-              ['year', 'Año', 'number', 'Ej. 1988'],
-              ['artist', 'Artista', 'text', 'Ej. Soda Stereo'],
-              ['title', 'Canción', 'text', 'Ej. En la ciudad de la furia'],
-              ['audioUrl', 'Enlace público del MP3 en R2', 'url', 'https://...r2.dev/cancion.mp3'],
-            ].map(([field, label, type, placeholder]) => (
-              <label key={field} className="flex flex-col gap-1 text-sm font-semibold text-gray-200">
-                {label}
-                <input
-                  required type={type} placeholder={placeholder} value={form[field]}
-                  onChange={(event) => {
-                    setForm((old) => ({ ...old, [field]: event.target.value }));
-                    setQrSong(null);
-                    setQrError('');
-                  }}
-                  className="p-3 bg-gray-700 rounded-lg text-white"
-                />
-              </label>
-            ))}
-            <button type="submit" className="bg-yellow-500 hover:bg-yellow-600 text-black font-black p-4 rounded-xl mt-2">GENERAR QR</button>
+          <h2 className="text-2xl font-black text-yellow-400 text-center mb-2">Generar código QR</h2>
+          <p className="text-gray-300 text-sm text-center mb-6">
+            Ingresa la información de la canción. Descargarás únicamente el QR, sin tarjeta ni PDF.
+          </p>
+
+          <form onSubmit={handleGenerateQR} className="flex flex-col gap-4">
+            <label className="flex flex-col gap-1 text-sm font-semibold text-gray-200">
+              Año de lanzamiento
+              <input required type="number" placeholder="Ej. 1998" className="p-3 bg-gray-700 rounded-lg text-white"
+                value={formData.year} onChange={(e) => updateField('year', e.target.value)} />
+            </label>
+            <label className="flex flex-col gap-1 text-sm font-semibold text-gray-200">
+              Artista
+              <input required type="text" placeholder="Ej. Shakira" className="p-3 bg-gray-700 rounded-lg text-white"
+                value={formData.artist} onChange={(e) => updateField('artist', e.target.value)} />
+            </label>
+            <label className="flex flex-col gap-1 text-sm font-semibold text-gray-200">
+              Nombre de la canción
+              <input required type="text" placeholder="Ej. Ciega, sordomuda" className="p-3 bg-gray-700 rounded-lg text-white"
+                value={formData.title} onChange={(e) => updateField('title', e.target.value)} />
+            </label>
+            <label className="flex flex-col gap-1 text-sm font-semibold text-gray-200">
+              Enlace de YouTube
+              <input required type="text" placeholder="Pega el link del video" className="p-3 bg-gray-700 rounded-lg text-white"
+                value={formData.youtubeId} onChange={(e) => updateField('youtubeId', e.target.value)} />
+            </label>
+            <button type="submit" className="bg-yellow-500 hover:bg-yellow-600 text-black font-black p-4 rounded-xl mt-2">
+              GENERAR QR
+            </button>
           </form>
-          {qrError && <p role="alert" className="mt-4 p-3 bg-red-950 text-red-200 rounded-lg">{qrError}</p>}
+
+          {qrError && (
+            <p role="alert" className="mt-4 text-red-200 bg-red-950 border border-red-600 rounded-lg p-3 text-sm">{qrError}</p>
+          )}
+
           {qrSong && (
             <div className="mt-7 border-t border-gray-600 pt-6 flex flex-col items-center gap-4">
-              <p className="text-green-400 font-bold">¡QR listo!</p>
-              <div className="bg-white rounded-xl p-3">
+              <p className="text-green-400 font-bold text-center">¡Tu QR está listo!</p>
+              {/* El archivo descargado contiene solo el QR en negro sobre blanco. */}
+              <div className="bg-white rounded-xl p-3 flex items-center justify-center">
                 <QRCodeCanvas
                   ref={qrCanvasRef}
                   value={JSON.stringify(qrSong)}
-                  size={700} level="M" marginSize={4}
-                  bgColor="#FFFFFF" fgColor="#000000"
+                  size={700}
+                  level="M"
+                  marginSize={4}
+                  bgColor="#FFFFFF"
+                  fgColor="#000000"
                   style={{ display: 'block', width: '240px', height: '240px' }}
                 />
               </div>
-              <p className="text-sm text-gray-300 text-center">{qrSong.artist} — {qrSong.title} ({qrSong.year})</p>
-              <button type="button" onClick={downloadQR} className="w-full p-4 rounded-xl font-black bg-green-500 hover:bg-green-600 flex items-center justify-center gap-2">
-                <Download size={22} /> DESCARGAR QR EN PNG
+              <p className="text-sm text-gray-300 text-center">
+                {qrSong.artist} — {qrSong.title} ({qrSong.year})
+              </p>
+              <button type="button" onClick={handleDownloadQR}
+                className="w-full bg-green-500 hover:bg-green-600 text-white font-black p-4 rounded-xl flex items-center justify-center gap-2">
+                <Download size={23} /> DESCARGAR QR EN PNG
               </button>
-              <button type="button" onClick={() => {
-                if (!motionRequestedRef.current) authorizeMotionFromClick();
-                warmUpAudioFromClick();
-                loadSong(qrSong);
-              }} className="w-full p-3 rounded-xl font-semibold border border-gray-500 hover:bg-gray-700">
-                Probar esta canción
+              <button type="button" onClick={handleNewQR}
+                className="w-full p-3 rounded-lg border border-gray-500 hover:bg-gray-700 font-semibold">
+                Crear otro QR
               </button>
-              <button type="button" onClick={() => {
-                setForm({ year: '', artist: '', title: '', audioUrl: '' });
-                setQrSong(null);
-              }} className="w-full p-3 rounded-xl border border-gray-500">Crear otro QR</button>
             </div>
           )}
-          <button onClick={goMenu} className="w-full text-center mt-6 text-sm text-gray-300 underline">Volver al menú</button>
+
+          <button onClick={() => setView('menu')} className="w-full text-center mt-6 text-sm text-gray-400 hover:text-white underline">
+            Volver al menú
+          </button>
         </div>
       )}
 
+      {/* El reproductor de YouTube se mantiene montado detrás de un fondo 100% opaco.
+          No usar display:none ni visibility:hidden: algunos navegadores bloquean el audio. */}
       {view === 'player' && currentSong && (
-        <div className="w-full max-w-md min-h-120 relative isolate overflow-hidden rounded-3xl bg-gray-950 border border-gray-700 shadow-2xl z-10">
-          <div className="relative min-h-120 w-full flex flex-col items-center justify-center p-8">
+        <div className="w-full max-w-md relative isolate overflow-hidden rounded-3xl bg-gray-950 border border-gray-700 shadow-2xl min-h-120 z-10">
+          <div className="absolute top-0 left-0 z-0 pointer-events-none" aria-hidden="true" style={{ width: 240, height: 200 }}>
+            <ReactPlayer
+              ref={playerRef}
+              src={`https://www.youtube.com/watch?v=${currentSong.youtubeId}`}
+              playing={isPlaying}
+              onReady={() => { setPlayerReady(true); setPlayerError(''); }}
+              onDurationChange={handleDurationChange}
+              onPlaying={handleActuallyPlaying}
+              onPause={() => { if (playTimerRef.current) clearTimeout(playTimerRef.current); playTimerRef.current = null; setIsPlaying(false); }}
+              onEnded={stopPlaying}
+              onError={() => { setPlayerError('No se pudo reproducir esta canción. Prueba otra tarjeta.'); stopPlaying(); }}
+              controls={false}
+              width="240px"
+              height="200px"
+              playsInline={true}
+              volume={1}
+              muted={false}
+              config={{ youtube: { playsinline: 1, rel: 0 } }}
+            />
+          </div>
+
+          {/* Esta capa opaca impide que se vea cualquier imagen o título de YouTube. */}
+          <div className="absolute inset-0 z-10 bg-gray-950 pointer-events-none" aria-hidden="true" />
+
+          <div className="relative z-20 min-h-120 w-full flex flex-col items-center justify-center p-8">
             <h2 className="text-xl text-gray-300 font-semibold mb-6 text-center">
               {isRevealed ? 'Respuesta revelada' : 'Escucha y adivina la canción'}
             </h2>
-            <div className={`relative flex items-center justify-center w-48 h-48 rounded-full bg-black border-4 border-gray-700 shadow-xl mb-6 ${isPlaying ? 'animate-spin' : ''}`}
-              style={{ animationDuration: '3s' }}>
+            <div
+              className={`relative flex items-center justify-center w-48 h-48 rounded-full bg-black border-4 border-gray-700 shadow-[0_0_30px_rgba(0,0,0,0.5)] mb-6 transition-transform duration-1000 ${isPlaying ? 'animate-spin' : ''}`}
+              style={{ animationDuration: '3s' }}
+            >
               <div className="absolute w-16 h-16 bg-yellow-500 rounded-full flex items-center justify-center">
                 <div className="w-4 h-4 bg-gray-900 rounded-full" />
               </div>
             </div>
-            
-            {/* CORRECCIÓN: Botón desbloqueado siempre que el juego siga activo. 
-                Si isPrepared era false indefinidamente, esto impedía el click manual. */}
             <button
-              disabled={isRevealed || isFinished}
-              onClick={() => { if (isPlaying) pauseSong(); else playSong(); }}
+              onClick={togglePlay}
+              disabled={isRevealed}
               aria-label={isPlaying ? 'Pausar canción' : 'Reproducir canción'}
-              className="w-20 h-20 bg-green-500 hover:bg-green-600 disabled:opacity-40 rounded-full flex items-center justify-center shadow-lg mb-4"
+              className="w-20 h-20 bg-green-500 hover:bg-green-600 disabled:opacity-50 disabled:cursor-not-allowed rounded-full flex items-center justify-center shadow-lg transition active:scale-95 mb-4"
             >
-              {isPlaying ? <Pause size={36} /> : <Play size={36} className="ml-2" />}
+              {isPlaying ? <Pause size={36} className="text-white" /> : <Play size={36} className="text-white ml-2" />}
             </button>
-            
             {!isRevealed && (
-              <p role={audioError ? 'alert' : undefined} className="text-sm text-gray-300 mb-4 text-center min-h-10">
-                {audioError || (isFinished ? 'Los 30 segundos terminaron. Revela la respuesta o escanea otra tarjeta.'
-                  : !isPrepared ? 'Cargando pista...'
-                    : isPlaying ? 'Reproduciendo 30 segundos aleatorios.'
-                      : motionAllowed ? 'Pon el celular boca abajo o presiona Play para iniciar.'
-                        : 'Presiona Play para escuchar la canción.')}
+              <p className="text-sm text-gray-300 mb-6 text-center" role={playerError ? 'alert' : undefined}>
+                {playerError || (playerReady ? 'Presiona Play para escuchar 30 segundos.' : 'Cargando canción...')}
               </p>
             )}
             {isRevealed && (
               <div className="w-full text-center mb-6">
-                <div className="text-6xl font-black text-yellow-400 mb-2">{currentSong.year}</div>
-                <h3 className="text-2xl font-bold">{currentSong.title}</h3>
+                <div className="text-6xl font-black text-yellow-400 mb-2 drop-shadow-lg">{currentSong.year}</div>
+                <h3 className="text-2xl font-bold text-white">{currentSong.title}</h3>
                 <p className="text-lg text-gray-300">{currentSong.artist}</p>
               </div>
             )}
             {!isRevealed && (
-              <button onClick={reveal} className="w-full py-4 bg-yellow-500 hover:bg-yellow-600 text-black font-black text-xl rounded-xl flex items-center justify-center gap-2">
+              <button
+                onClick={() => { setIsRevealed(true); stopPlaying(); }}
+                className="w-full py-4 bg-yellow-500 hover:bg-yellow-600 text-black font-black text-xl rounded-xl flex items-center justify-center gap-2"
+              >
                 <CheckCircle2 size={24} /> REVELAR RESPUESTA
               </button>
             )}
-            <button onClick={openScanner} className="mt-8 text-sm text-gray-300 underline">Escanear otra tarjeta</button>
+            <button onClick={() => { setView('menu'); stopPlaying(); }} className="mt-8 text-sm text-gray-400 hover:text-white transition-colors">
+              Escanear otra tarjeta
+            </button>
           </div>
         </div>
       )}
