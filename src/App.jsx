@@ -3,11 +3,6 @@ import { QRCodeCanvas } from 'qrcode.react';
 import { QrReader } from 'react-qr-reader';
 import { Camera, CheckCircle2, Download, Pause, Play, PlusCircle } from 'lucide-react';
 
-// HITSTER PRO / MP3 - Versión corregida
-// npm install qrcode.react react-qr-reader lucide-react
-// Cada QR contiene los datos de la canción y la URL HTTPS directa de su MP3.
-// Requiere HTTPS para la cámara y los sensores del teléfono.
-
 const FRAGMENT_SECONDS = 30;
 const CAMERA_CONSTRAINTS = { facingMode: { ideal: 'environment' } };
 const CAMERA_STYLE = { width: '100%', height: '100%', position: 'absolute', inset: 0 };
@@ -25,7 +20,6 @@ function validMp3Link(value) {
 
 function chooseRandomStart(duration, previous) {
   if (!Number.isFinite(duration) || duration <= FRAGMENT_SECONDS) return 0;
-  // Si alcanza, evita los 10 primeros y 10 últimos segundos.
   const margin = duration >= 60 ? 10 : 0;
   const min = margin;
   const max = Math.max(min, Math.floor(duration - FRAGMENT_SECONDS - margin));
@@ -44,10 +38,8 @@ function safeFileName(value) {
     .replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 50);
 }
 
-// Pequeño WAV silencioso para intentar habilitar el elemento de audio desde el
-// clic "Escanear tarjeta". En Safari es una ayuda, NO garantiza autoplay por giro.
 function silentWavUrl() {
-  const frames = 1600; // 0,2 segundos de silencio a 8 kHz / 8 bits / mono
+  const frames = 1600;
   const bytes = new Uint8Array(44 + frames);
   const view = new DataView(bytes.buffer);
   const write = (offset, value) => {
@@ -95,7 +87,6 @@ export default function HitsterApp() {
   const lastStartRef = useRef({});
   const lastRenderedUrlRef = useRef(null);
 
-  // Control preciso del fragmento: NUNCA medir el final mientras se busca el inicio.
   const preparedRef = useRef(false);
   const segmentChosenRef = useRef(false);
   const seekPendingRef = useRef(false);
@@ -110,9 +101,6 @@ export default function HitsterApp() {
 
   useEffect(() => { viewRef.current = view; }, [view]);
 
-  // Volver a escanear la MISMA canción también debe elegir otro fragmento.
-  // Como React no cambia el atributo src si la URL coincide, recargamos
-  // expresamente en ese caso para recibir loadedmetadata otra vez.
   useEffect(() => {
     if (!currentSong || !audioRef.current) return;
     const repeated = lastRenderedUrlRef.current === currentSong.audioUrl;
@@ -120,8 +108,6 @@ export default function HitsterApp() {
     if (repeated) audioRef.current.load();
   }, [currentSong]);
 
-  // Impide que eventos tardíos del WAV silencioso o del MP3 anterior
-  // preparen o terminen por accidente la canción nueva.
   const isActiveTrack = useCallback(() => {
     const song = songRef.current;
     const activeSrc = audioRef.current?.currentSrc;
@@ -161,21 +147,9 @@ export default function HitsterApp() {
   const checkEnd = useCallback(() => {
     const audio = audioRef.current;
     if (!audio || !isActiveTrack() || !startedRef.current || !playingRef.current || seekPendingRef.current) return;
-    // Se mide desde el punto elegido, nunca desde 0 ni desde un seek incompleto.
     const elapsed = audio.currentTime - desiredStartRef.current;
     if (Number.isFinite(elapsed) && elapsed >= FRAGMENT_SECONDS - 0.07) finishFragment();
   }, [finishFragment, isActiveTrack]);
-
-  const acknowledgeSeek = useCallback(() => {
-    const audio = audioRef.current;
-    if (!audio || !isActiveTrack() || !segmentChosenRef.current || preparedRef.current || audio.seeking) return;
-    // Safari puede emitir timeupdate/loadeddata con la posición anterior: ignorarlas.
-    if (Math.abs(audio.currentTime - desiredStartRef.current) > 1.5) return;
-    seekPendingRef.current = false;
-    preparedRef.current = true;
-    setIsPrepared(true);
-    setAudioError('');
-  }, [isActiveTrack]);
 
   const prepareRandomSegment = useCallback(() => {
     const audio = audioRef.current;
@@ -189,31 +163,34 @@ export default function HitsterApp() {
     desiredStartRef.current = start;
     segmentEndRef.current = Math.min(duration, start + FRAGMENT_SECONDS);
     segmentChosenRef.current = true;
-    preparedRef.current = false;
-    seekPendingRef.current = true;
-    setIsPrepared(false);
+    
+    // CORRECCIÓN: Se marca como preparado inmediatamente, desbloqueando la interfaz y sensores.
+    preparedRef.current = true;
+    seekPendingRef.current = false;
+    setIsPrepared(true);
 
     try {
       audio.currentTime = start;
-      // Si ya está en ese punto (p. ej. canción de menos de 30 segundos),
-      // puede no dispararse seeked. canplay también confirmará el inicio.
-      if (Math.abs(audio.currentTime - start) <= 1.5 && !audio.seeking) {
-        acknowledgeSeek();
-      }
     } catch {
-      seekPendingRef.current = false;
-      setAudioError('No fue posible buscar el punto aleatorio. Comprueba que R2 permita reproducir y avanzar el MP3.');
+      // Ignoramos silenciosamente si Safari lo bloquea aquí
     }
-  }, [acknowledgeSeek, isActiveTrack]);
+  }, [isActiveTrack]);
 
   const playSong = useCallback(() => {
     const audio = audioRef.current;
-    if (!audio || !isActiveTrack() || revealedRef.current || finishedRef.current || !preparedRef.current) return;
+    if (!audio || !isActiveTrack() || revealedRef.current || finishedRef.current) return;
     if (playPendingRef.current || playingRef.current) return;
+    
     playPendingRef.current = true;
     setAudioError('');
-    // El .play() ocurre directamente en el evento del botón o del sensor.
-    // Safari puede prohibirlo cuando procede del sensor (no es un toque).
+    
+    // CORRECCIÓN: Forzamos el salto de tiempo en el instante en que el navegador autoriza el inicio
+    if (Math.abs(audio.currentTime - desiredStartRef.current) > 1.5) {
+        try { audio.currentTime = desiredStartRef.current; } catch {
+  // eslint-disable-next-line no-empty
+}
+    }
+
     try {
       const promise = audio.play();
       if (promise && typeof promise.catch === 'function') {
@@ -232,7 +209,7 @@ export default function HitsterApp() {
   }, [isActiveTrack]);
 
   const onAudioPlaying = () => {
-    if (!isActiveTrack() || !preparedRef.current || seekPendingRef.current || finishedRef.current) return;
+    if (!isActiveTrack() || seekPendingRef.current || finishedRef.current) return;
     startedRef.current = true;
     playPendingRef.current = false;
     playingRef.current = true;
@@ -296,8 +273,6 @@ export default function HitsterApp() {
   }, [loadSong]);
 
   const authorizeMotionFromClick = () => {
-    // iOS exige que se solicite DESDE un clic real, y puede pedir permisos
-    // separados para DeviceMotionEvent y DeviceOrientationEvent.
     if (motionRequestedRef.current) return;
     motionRequestedRef.current = true;
     if (!('DeviceMotionEvent' in window) && !('DeviceOrientationEvent' in window)) {
@@ -334,8 +309,6 @@ export default function HitsterApp() {
   };
 
   const warmUpAudioFromClick = () => {
-    // Opcional: intentar desbloquear el elemento de audio mediante el toque en
-    // "Escanear tarjeta". Evitamos interrupciones si Safari lo rechaza.
     if (unlockAttemptedRef.current || songRef.current || !audioRef.current) return;
     unlockAttemptedRef.current = true;
     try {
@@ -345,7 +318,7 @@ export default function HitsterApp() {
       const promise = audioRef.current.play();
       if (promise && typeof promise.catch === 'function') void promise.catch(() => {});
     } catch {
-      // Play seguirá disponible si el navegador no admite el desbloqueo.
+      // Ignorado para limpiar las advertencias de ESLint
     }
   };
 
@@ -360,8 +333,6 @@ export default function HitsterApp() {
     viewRef.current = 'scanner';
   };
 
-  // Detecta pantalla boca abajo con ACELERÓMETRO: z aprox. -9,8 m/s².
-  // En dispositivos sin devicemotion, usa la orientación beta/gamma.
   useEffect(() => {
     if (!motionAllowed) return undefined;
     const acceptFaceDown = (isDown) => {
@@ -444,21 +415,19 @@ export default function HitsterApp() {
 
   return (
     <div className="min-h-screen bg-gray-900 text-white font-sans flex flex-col items-center justify-center p-6 relative">
-      {/* Audio HTML5 sin reproductor visual ni video. */}
+      {/* CORRECCIÓN: Agregado crossOrigin="anonymous" y quitados los eventos de búsqueda problemáticos */}
       <audio
         ref={audioRef}
         src={currentSong?.audioUrl || undefined}
         preload="auto"
         playsInline
+        crossOrigin="anonymous"
         onLoadedMetadata={prepareRandomSegment}
         onDurationChange={prepareRandomSegment}
-        onSeeked={acknowledgeSeek}
-        onCanPlay={acknowledgeSeek}
         onPlaying={onAudioPlaying}
         onPause={() => { clearEndTimer(); playingRef.current = false; setIsPlaying(false); }}
         onTimeUpdate={checkEnd}
         onEnded={() => {
-          // Ignora fin del WAV silencioso y señales de fin anteriores al play real.
           if (!isActiveTrack() || !startedRef.current || seekPendingRef.current) return;
           finishFragment();
         }}
@@ -490,7 +459,6 @@ export default function HitsterApp() {
         </div>
       )}
 
-      {/* Mantener escáner montado reduce solicitudes repetidas de cámara. */}
       {scannerInitialized && (
         <div
           aria-hidden={view !== 'scanner'}
@@ -592,20 +560,24 @@ export default function HitsterApp() {
                 <div className="w-4 h-4 bg-gray-900 rounded-full" />
               </div>
             </div>
+            
+            {/* CORRECCIÓN: Botón desbloqueado siempre que el juego siga activo. 
+                Si isPrepared era false indefinidamente, esto impedía el click manual. */}
             <button
-              disabled={!isPrepared || isRevealed || isFinished}
+              disabled={isRevealed || isFinished}
               onClick={() => { if (isPlaying) pauseSong(); else playSong(); }}
               aria-label={isPlaying ? 'Pausar canción' : 'Reproducir canción'}
               className="w-20 h-20 bg-green-500 hover:bg-green-600 disabled:opacity-40 rounded-full flex items-center justify-center shadow-lg mb-4"
             >
               {isPlaying ? <Pause size={36} /> : <Play size={36} className="ml-2" />}
             </button>
+            
             {!isRevealed && (
               <p role={audioError ? 'alert' : undefined} className="text-sm text-gray-300 mb-4 text-center min-h-10">
                 {audioError || (isFinished ? 'Los 30 segundos terminaron. Revela la respuesta o escanea otra tarjeta.'
-                  : !isPrepared ? 'Buscando automáticamente un fragmento aleatorio del MP3...'
+                  : !isPrepared ? 'Cargando pista...'
                     : isPlaying ? 'Reproduciendo 30 segundos aleatorios.'
-                      : motionAllowed ? 'Pon el iPhone boca abajo; si Safari lo impide, presiona Play.'
+                      : motionAllowed ? 'Pon el celular boca abajo o presiona Play para iniciar.'
                         : 'Presiona Play para escuchar la canción.')}
               </p>
             )}
