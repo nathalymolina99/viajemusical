@@ -35,9 +35,11 @@ export default function HitsterApp() {
   const songAlreadyScannedRef = useRef(false);
   const didSeekRef = useRef(false);
   const viewRef = useRef(view);
+
+  // Sincronizar el ref después del render (react-hooks/refs).
   useEffect(() => {
-  viewRef.current = view;
-}, [view]);
+    viewRef.current = view;
+  }, [view]);
 
   // Admite URL normal, enlace corto, Shorts o un ID directo de YouTube.
   const extractYouTubeID = (value) => {
@@ -266,7 +268,7 @@ export default function HitsterApp() {
           aria-hidden={view !== 'scanner'}
           className={view === 'scanner'
             ? 'w-full max-w-md flex flex-col items-center z-10'
-            : 'fixed -left-[10000px] top-0 w-[320px] h-[320px] opacity-0 pointer-events-none overflow-hidden'
+            : 'fixed left-[-10000px] top-0 w-80 h-80 opacity-0 pointer-events-none overflow-hidden'
           }
         >
           {view === 'scanner' && (
@@ -333,7 +335,7 @@ export default function HitsterApp() {
       {/* El reproductor de YouTube se mantiene montado detrás de un fondo 100% opaco.
           No usar display:none ni visibility:hidden: algunos navegadores bloquean el audio. */}
       {view === 'player' && currentSong && (
-        <div className="w-full max-w-md relative isolate overflow-hidden rounded-3xl bg-gray-950 border border-gray-700 shadow-2xl min-h-[480px] z-10">
+        <div className="w-full max-w-md relative isolate overflow-hidden rounded-3xl bg-gray-950 border border-gray-700 shadow-2xl min-h-120 z-10">
           <div className="absolute top-0 left-0 z-0 pointer-events-none" aria-hidden="true" style={{ width: 240, height: 200 }}>
             <ReactPlayer
               ref={playerRef}
@@ -358,7 +360,7 @@ export default function HitsterApp() {
           {/* Esta capa opaca impide que se vea cualquier imagen o título de YouTube. */}
           <div className="absolute inset-0 z-10 bg-gray-950 pointer-events-none" aria-hidden="true" />
 
-          <div className="relative z-20 min-h-[480px] w-full flex flex-col items-center justify-center p-8">
+          <div className="relative z-20 min-h-120 w-full flex flex-col items-center justify-center p-8">
             <h2 className="text-xl text-gray-300 font-semibold mb-6 text-center">
               {isRevealed ? 'Respuesta revelada' : 'Escucha y adivina la canción'}
             </h2>
