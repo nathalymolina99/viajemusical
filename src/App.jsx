@@ -1,20 +1,20 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { QRCodeCanvas } from 'qrcode.react';
 import { QrReader } from 'react-qr-reader';
-import { Play, Pause, Camera, PlusCircle, CheckCircle2, Download, RefreshCw } from 'lucide-react';
+import { Camera, CheckCircle2, Download, Pause, Play, PlusCircle } from 'lucide-react';
 
-// HITSTER PRO - PRUEBA MP3 / Cloudflare R2
-// Dependencias: npm install qrcode.react react-qr-reader lucide-react
-// No se necesitan claves ni tokens de Cloudflare en el frontend.
-// Usar un enlace HTTPS publico y directo a un MP3 que tengas permiso para reproducir.
+// HITSTER PRO / MP3 - Versión corregida
+// npm install qrcode.react react-qr-reader lucide-react
+// Cada QR contiene los datos de la canción y la URL HTTPS directa de su MP3.
+// Requiere HTTPS para la cámara y los sensores del teléfono.
 
+const FRAGMENT_SECONDS = 30;
 const CAMERA_CONSTRAINTS = { facingMode: { ideal: 'environment' } };
 const CAMERA_STYLE = { width: '100%', height: '100%', position: 'absolute', inset: 0 };
 const VIDEO_CONTAINER_STYLE = { width: '100%', height: '100%', paddingTop: 0, position: 'relative', overflow: 'hidden' };
-const VIDEO_STYLE = { display: 'block', width: '100%', height: '100%', objectFit: 'cover', position: 'absolute', top: 0, left: 0 };
-const SEGMENT_SECONDS = 30;
+const VIDEO_STYLE = { width: '100%', height: '100%', objectFit: 'cover', position: 'absolute', inset: 0 };
 
-function isValidAudioUrl(value) {
+function validMp3Link(value) {
   try {
     const url = new URL(String(value || '').trim());
     return url.protocol === 'https:' || (url.protocol === 'http:' && url.hostname === 'localhost');
@@ -23,195 +23,266 @@ function isValidAudioUrl(value) {
   }
 }
 
-function pickSegmentStart(duration, previousStart) {
-  if (!Number.isFinite(duration) || duration <= 0) return 0;
-  // Si dura al menos 60 s, evitamos introduccion y final (10 s cada uno).
-  const hasMargin = duration >= 60;
-  const minimum = hasMargin ? 10 : 0;
-  const maximum = Math.max(minimum, Math.floor(duration - SEGMENT_SECONDS - (hasMargin ? 10 : 0)));
-  if (maximum <= minimum) return minimum;
-
-  // Busca que el nuevo fragmento sea notablemente diferente al anterior.
-  const distance = Math.min(15, Math.max(1, (maximum - minimum) / 3));
-  for (let i = 0; i < 30; i += 1) {
-    const candidate = minimum + Math.floor(Math.random() * (maximum - minimum + 1));
-    if (!Number.isFinite(previousStart) || Math.abs(candidate - previousStart) >= distance) {
-      return candidate;
-    }
+function chooseRandomStart(duration, previous) {
+  if (!Number.isFinite(duration) || duration <= FRAGMENT_SECONDS) return 0;
+  // Si alcanza, evita los 10 primeros y 10 últimos segundos.
+  const margin = duration >= 60 ? 10 : 0;
+  const min = margin;
+  const max = Math.max(min, Math.floor(duration - FRAGMENT_SECONDS - margin));
+  if (max === min) return min;
+  const minimumDifference = Math.min(15, Math.max(1, Math.floor((max - min) / 3)));
+  for (let attempt = 0; attempt < 35; attempt += 1) {
+    const start = min + Math.floor(Math.random() * (max - min + 1));
+    if (!Number.isFinite(previous) || Math.abs(previous - start) >= minimumDifference) return start;
   }
-  return Math.abs(previousStart - minimum) > Math.abs(previousStart - maximum) ? minimum : maximum;
+  return Math.abs(previous - min) > Math.abs(previous - max) ? min : max;
 }
 
-function safeFilename(text) {
-  return String(text || 'cancion')
+function safeFileName(value) {
+  return String(value || 'cancion')
     .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     .replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 50);
 }
 
+// Pequeño WAV silencioso para intentar habilitar el elemento de audio desde el
+// clic "Escanear tarjeta". En Safari es una ayuda, NO garantiza autoplay por giro.
+function silentWavUrl() {
+  const frames = 1600; // 0,2 segundos de silencio a 8 kHz / 8 bits / mono
+  const bytes = new Uint8Array(44 + frames);
+  const view = new DataView(bytes.buffer);
+  const write = (offset, value) => {
+    for (let index = 0; index < value.length; index += 1) bytes[offset + index] = value.charCodeAt(index);
+  };
+  write(0, 'RIFF'); view.setUint32(4, 36 + frames, true);
+  write(8, 'WAVE'); write(12, 'fmt '); view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, 8000, true); view.setUint32(28, 8000, true);
+  view.setUint16(32, 1, true); view.setUint16(34, 8, true);
+  write(36, 'data'); view.setUint32(40, frames, true);
+  bytes.fill(128, 44);
+  return URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
+}
+
 export default function HitsterApp() {
   const [view, setView] = useState('menu');
-  const [form, setForm] = useState({ title: '', artist: '', year: '', audioUrl: '' });
+  const [form, setForm] = useState({ year: '', artist: '', title: '', audioUrl: '' });
   const [qrSong, setQrSong] = useState(null);
   const [qrError, setQrError] = useState('');
-  const qrCanvasRef = useRef(null);
 
   const [scannerInitialized, setScannerInitialized] = useState(false);
   const [scannerError, setScannerError] = useState('');
-  const [motionEnabled, setMotionEnabled] = useState(false);
+  const [motionAllowed, setMotionAllowed] = useState(false);
   const [motionMessage, setMotionMessage] = useState('');
-
   const [currentSong, setCurrentSong] = useState(null);
-  const [audioVersion, setAudioVersion] = useState(0);
-  const [audioReady, setAudioReady] = useState(false);
-  const [audioError, setAudioError] = useState('');
+  const [isPrepared, setIsPrepared] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [isFinished, setIsFinished] = useState(false);
   const [isRevealed, setIsRevealed] = useState(false);
-  const [finished, setFinished] = useState(false);
+  const [audioError, setAudioError] = useState('');
 
   const audioRef = useRef(null);
+  const qrCanvasRef = useRef(null);
   const viewRef = useRef(view);
-  const currentSongRef = useRef(null);
-  const readyRef = useRef(false);
+  const songRef = useRef(null);
+  const scannerBusyRef = useRef(false);
+  const motionRequestedRef = useRef(false);
+  const motionAllowedRef = useRef(false);
+  const motionSamplesSeenRef = useRef(false);
+  const downSinceRef = useRef(null);
+  const autoTriggeredRef = useRef(false);
+  const unlockAttemptedRef = useRef(false);
+  const silenceUrlRef = useRef(null);
+  const lastStartRef = useRef({});
+  const lastRenderedUrlRef = useRef(null);
+
+  // Control preciso del fragmento: NUNCA medir el final mientras se busca el inicio.
+  const preparedRef = useRef(false);
+  const segmentChosenRef = useRef(false);
+  const seekPendingRef = useRef(false);
+  const desiredStartRef = useRef(0);
+  const segmentEndRef = useRef(0);
+  const startedRef = useRef(false);
+  const playPendingRef = useRef(false);
   const playingRef = useRef(false);
   const finishedRef = useRef(false);
   const revealedRef = useRef(false);
-  const scannedRef = useRef(false);
-  const flippedAlreadyRef = useRef(false);
-  const lastStartByUrlRef = useRef({});
-  const segmentEndRef = useRef(0);
-  const stopTimerRef = useRef(null);
+  const endIntervalRef = useRef(null);
 
   useEffect(() => { viewRef.current = view; }, [view]);
 
-  const clearStopTimer = useCallback(() => {
-    if (stopTimerRef.current) window.clearInterval(stopTimerRef.current);
-    stopTimerRef.current = null;
+  // Volver a escanear la MISMA canción también debe elegir otro fragmento.
+  // Como React no cambia el atributo src si la URL coincide, recargamos
+  // expresamente en ese caso para recibir loadedmetadata otra vez.
+  useEffect(() => {
+    if (!currentSong || !audioRef.current) return;
+    const repeated = lastRenderedUrlRef.current === currentSong.audioUrl;
+    lastRenderedUrlRef.current = currentSong.audioUrl;
+    if (repeated) audioRef.current.load();
+  }, [currentSong]);
+
+  // Impide que eventos tardíos del WAV silencioso o del MP3 anterior
+  // preparen o terminen por accidente la canción nueva.
+  const isActiveTrack = useCallback(() => {
+    const song = songRef.current;
+    const activeSrc = audioRef.current?.currentSrc;
+    if (!song || !activeSrc) return false;
+    try {
+      return new URL(activeSrc, window.location.href).href === new URL(song.audioUrl, window.location.href).href;
+    } catch {
+      return false;
+    }
   }, []);
 
-  const pause = useCallback(() => {
-    clearStopTimer();
+  const clearEndTimer = useCallback(() => {
+    if (endIntervalRef.current !== null) window.clearInterval(endIntervalRef.current);
+    endIntervalRef.current = null;
+  }, []);
+
+  const pauseSong = useCallback(() => {
+    clearEndTimer();
+    if (audioRef.current) audioRef.current.pause();
+    playingRef.current = false;
+    playPendingRef.current = false;
+    setIsPlaying(false);
+  }, [clearEndTimer]);
+
+  const finishFragment = useCallback(() => {
+    if (!isActiveTrack() || !startedRef.current || seekPendingRef.current || finishedRef.current) return;
     const audio = audioRef.current;
     if (audio) audio.pause();
+    clearEndTimer();
     playingRef.current = false;
-    setIsPlaying(false);
-  }, [clearStopTimer]);
-
-  const stopAtEnd = useCallback(() => {
-    const audio = audioRef.current;
-    if (audio && !audio.paused) audio.pause();
-    clearStopTimer();
-    playingRef.current = false;
+    playPendingRef.current = false;
     finishedRef.current = true;
-    setFinished(true);
     setIsPlaying(false);
-  }, [clearStopTimer]);
+    setIsFinished(true);
+  }, [clearEndTimer, isActiveTrack]);
 
-  const checkSegmentEnd = useCallback(() => {
+  const checkEnd = useCallback(() => {
     const audio = audioRef.current;
-    if (!audio || !playingRef.current) return;
-    if (audio.currentTime >= segmentEndRef.current - 0.08) stopAtEnd();
-  }, [stopAtEnd]);
+    if (!audio || !isActiveTrack() || !startedRef.current || !playingRef.current || seekPendingRef.current) return;
+    // Se mide desde el punto elegido, nunca desde 0 ni desde un seek incompleto.
+    const elapsed = audio.currentTime - desiredStartRef.current;
+    if (Number.isFinite(elapsed) && elapsed >= FRAGMENT_SECONDS - 0.07) finishFragment();
+  }, [finishFragment, isActiveTrack]);
 
-  const selectSegment = useCallback(() => {
+  const acknowledgeSeek = useCallback(() => {
     const audio = audioRef.current;
-    const song = currentSongRef.current;
-    if (!audio || !song || !Number.isFinite(audio.duration) || audio.duration <= 0) return false;
-    const previous = lastStartByUrlRef.current[song.audioUrl];
-    const start = pickSegmentStart(audio.duration, previous);
-    lastStartByUrlRef.current[song.audioUrl] = start;
-    segmentEndRef.current = Math.min(audio.duration, start + SEGMENT_SECONDS);
-    audio.currentTime = start;
-    readyRef.current = true;
-    finishedRef.current = false;
-    setFinished(false);
-    setAudioReady(true);
-    return true;
-  }, []);
-
-  const play = useCallback(async () => {
-    const audio = audioRef.current;
-    if (!audio || !currentSongRef.current || revealedRef.current) return;
-    if (!readyRef.current) {
-      setAudioError('Esperando a que cargue el MP3. Si tarda, revisa el enlace.');
-      return;
-    }
-    if (finishedRef.current) selectSegment();
+    if (!audio || !isActiveTrack() || !segmentChosenRef.current || preparedRef.current || audio.seeking) return;
+    // Safari puede emitir timeupdate/loadeddata con la posición anterior: ignorarlas.
+    if (Math.abs(audio.currentTime - desiredStartRef.current) > 1.5) return;
+    seekPendingRef.current = false;
+    preparedRef.current = true;
+    setIsPrepared(true);
     setAudioError('');
-    try {
-      // Safari solo permite la reproduccion por giro si su politica de audio lo autoriza.
-      await audio.play();
-    } catch (error) {
-      playingRef.current = false;
-      setIsPlaying(false);
-      setAudioError(error?.name === 'NotAllowedError'
-        ? 'Safari bloqueó el inicio por giro. Presiona Play para escuchar la canción.'
-        : 'No se pudo iniciar el audio. Verifica que el enlace abra un MP3 reproducible.');
-    }
-  }, [selectSegment]);
+  }, [isActiveTrack]);
 
-  const handlePlaying = () => {
+  const prepareRandomSegment = useCallback(() => {
+    const audio = audioRef.current;
+    const song = songRef.current;
+    if (!audio || !song || !isActiveTrack() || segmentChosenRef.current) return;
+    const duration = audio.duration;
+    if (!Number.isFinite(duration) || duration <= 0) return;
+
+    const start = chooseRandomStart(duration, lastStartRef.current[song.audioUrl]);
+    lastStartRef.current[song.audioUrl] = start;
+    desiredStartRef.current = start;
+    segmentEndRef.current = Math.min(duration, start + FRAGMENT_SECONDS);
+    segmentChosenRef.current = true;
+    preparedRef.current = false;
+    seekPendingRef.current = true;
+    setIsPrepared(false);
+
+    try {
+      audio.currentTime = start;
+      // Si ya está en ese punto (p. ej. canción de menos de 30 segundos),
+      // puede no dispararse seeked. canplay también confirmará el inicio.
+      if (Math.abs(audio.currentTime - start) <= 1.5 && !audio.seeking) {
+        acknowledgeSeek();
+      }
+    } catch {
+      seekPendingRef.current = false;
+      setAudioError('No fue posible buscar el punto aleatorio. Comprueba que R2 permita reproducir y avanzar el MP3.');
+    }
+  }, [acknowledgeSeek, isActiveTrack]);
+
+  const playSong = useCallback(() => {
+    const audio = audioRef.current;
+    if (!audio || !isActiveTrack() || revealedRef.current || finishedRef.current || !preparedRef.current) return;
+    if (playPendingRef.current || playingRef.current) return;
+    playPendingRef.current = true;
+    setAudioError('');
+    // El .play() ocurre directamente en el evento del botón o del sensor.
+    // Safari puede prohibirlo cuando procede del sensor (no es un toque).
+    try {
+      const promise = audio.play();
+      if (promise && typeof promise.catch === 'function') {
+        void promise.catch((error) => {
+          playPendingRef.current = false;
+          if (error?.name === 'AbortError') return;
+          setAudioError(error?.name === 'NotAllowedError'
+            ? 'Safari bloqueó el inicio por giro. Toca Play una vez para escuchar esta canción.'
+            : 'No se pudo reproducir el MP3. Revisa el enlace y el formato del archivo.');
+        });
+      }
+    } catch {
+      playPendingRef.current = false;
+      setAudioError('No se pudo iniciar el MP3. Prueba con el botón Play.');
+    }
+  }, [isActiveTrack]);
+
+  const onAudioPlaying = () => {
+    if (!isActiveTrack() || !preparedRef.current || seekPendingRef.current || finishedRef.current) return;
+    startedRef.current = true;
+    playPendingRef.current = false;
     playingRef.current = true;
     setIsPlaying(true);
     setAudioError('');
-    clearStopTimer();
-    // El evento timeupdate es la referencia principal. Este control ayuda en primer plano.
-    stopTimerRef.current = window.setInterval(checkSegmentEnd, 250);
-  };
-
-  const onNewAudio = () => {
-    readyRef.current = false;
-    playingRef.current = false;
-    finishedRef.current = false;
-    clearStopTimer();
-    setAudioReady(false);
-    setIsPlaying(false);
-    setFinished(false);
-    setAudioError('');
+    clearEndTimer();
+    endIntervalRef.current = window.setInterval(checkEnd, 200);
   };
 
   const loadSong = useCallback((song) => {
-    const audio = audioRef.current;
-    if (audio) audio.pause();
-    playingRef.current = false;
-    readyRef.current = false;
+    pauseSong();
+    songRef.current = song;
+    preparedRef.current = false;
+    segmentChosenRef.current = false;
+    seekPendingRef.current = false;
+    desiredStartRef.current = 0;
+    segmentEndRef.current = 0;
+    startedRef.current = false;
     finishedRef.current = false;
     revealedRef.current = false;
-    flippedAlreadyRef.current = false;
-    currentSongRef.current = song;
-    // Fuerza cargar de nuevo incluso si escaneamos dos veces el mismo MP3.
-    setAudioVersion((version) => version + 1);
+    autoTriggeredRef.current = false;
+    downSinceRef.current = null;
     setCurrentSong(song);
+    setIsPrepared(false);
     setIsPlaying(false);
-    setFinished(false);
+    setIsFinished(false);
     setIsRevealed(false);
-    setAudioReady(false);
     setAudioError('');
     setView('player');
     viewRef.current = 'player';
-  }, []);
+  }, [pauseSong]);
 
   const handleScan = useCallback((result, error) => {
     if (viewRef.current !== 'scanner') return;
-    if (error) {
-      if (['NotAllowedError', 'PermissionDeniedError', 'SecurityError'].includes(error.name)) {
-        setScannerError('Autoriza el uso de la cámara en Safari. Necesitas abrir el sitio mediante HTTPS.');
-      } else if (['NotFoundError', 'OverconstrainedError'].includes(error.name)) {
-        setScannerError('No se encontró una cámara disponible.');
-      } else if (error.name === 'NotReadableError') {
-        setScannerError('La cámara está ocupada por otra aplicación.');
-      }
+    if (error && ['NotAllowedError', 'PermissionDeniedError', 'SecurityError'].includes(error.name)) {
+      setScannerError('Permite el uso de la cámara en Safari y abre la web mediante HTTPS.');
+    } else if (error && ['NotFoundError', 'OverconstrainedError'].includes(error.name)) {
+      setScannerError('No se encontró una cámara disponible.');
     }
-    if (!result?.text || scannedRef.current) return;
+    if (!result?.text || scannerBusyRef.current) return;
     try {
       const parsed = JSON.parse(result.text);
       const audioUrl = String(parsed.audioUrl || parsed.mp3Url || '').trim();
-      if (!isValidAudioUrl(audioUrl)) {
+      if (!validMp3Link(audioUrl)) {
         setScannerError(parsed.youtubeId
-          ? 'Este es un QR antiguo de YouTube. Para usar MP3, crea uno nuevo con el enlace del audio.'
-          : 'El QR no contiene un enlace HTTPS a un archivo de audio.');
+          ? 'Este QR utiliza YouTube. Crea un QR nuevo con el archivo MP3.'
+          : 'El QR no contiene un enlace HTTPS válido a un MP3.');
         return;
       }
-      scannedRef.current = true;
+      scannerBusyRef.current = true;
       setScannerError('');
       loadSong({
         audioUrl,
@@ -220,145 +291,188 @@ export default function HitsterApp() {
         year: String(parsed.year || ''),
       });
     } catch {
-      setScannerError('No es un QR válido de Hitster Pro.');
+      setScannerError('Este código no tiene el formato QR de Hitster Pro.');
     }
   }, [loadSong]);
 
-  // En iOS el permiso del sensor debe pedirse desde un toque real del usuario.
-  const requestMotionPermission = () => {
-    if (typeof window === 'undefined' || !('DeviceOrientationEvent' in window)) {
-      setMotionMessage('Este dispositivo no dispone de orientación. Puedes usar Play.');
+  const authorizeMotionFromClick = () => {
+    // iOS exige que se solicite DESDE un clic real, y puede pedir permisos
+    // separados para DeviceMotionEvent y DeviceOrientationEvent.
+    if (motionRequestedRef.current) return;
+    motionRequestedRef.current = true;
+    if (!('DeviceMotionEvent' in window) && !('DeviceOrientationEvent' in window)) {
+      setMotionMessage('Este dispositivo no tiene sensores de giro. Usa Play.');
       return;
     }
     try {
-      const Motion = window.DeviceOrientationEvent;
-      if (typeof Motion.requestPermission === 'function') {
-        // La llamada ocurre directamente dentro del click, sin await previo.
-        Motion.requestPermission().then((decision) => {
-          if (decision === 'granted') {
-            setMotionEnabled(true);
-            setMotionMessage('Giro activado.');
-          } else {
-            setMotionEnabled(false);
-            setMotionMessage('No se autorizó el sensor. Puedes reproducir con Play.');
-          }
-        }).catch(() => {
-          setMotionEnabled(false);
-          setMotionMessage('No fue posible activar el sensor. Puedes reproducir con Play.');
-        });
+      const requests = [];
+      if (typeof window.DeviceMotionEvent?.requestPermission === 'function') {
+        requests.push(window.DeviceMotionEvent.requestPermission());
+      }
+      if (typeof window.DeviceOrientationEvent?.requestPermission === 'function') {
+        requests.push(window.DeviceOrientationEvent.requestPermission());
+      }
+      if (requests.length === 0) {
+        motionAllowedRef.current = true;
+        setMotionAllowed(true);
+        setMotionMessage('Detección del giro habilitada.');
       } else {
-        setMotionEnabled(true);
-        setMotionMessage('Giro activado si el dispositivo admite el sensor.');
+        void Promise.all(requests).then((answers) => {
+          const granted = answers.some((answer) => answer === 'granted');
+          motionAllowedRef.current = granted;
+          setMotionAllowed(granted);
+          setMotionMessage(granted
+            ? 'Giro autorizado. Coloca el teléfono boca abajo para intentar reproducir.'
+            : 'Safari no autorizó los sensores. Puedes usar Play.');
+        }).catch(() => {
+          setMotionMessage('No se pudo autorizar el giro. Puedes usar Play.');
+        });
       }
     } catch {
-      setMotionMessage('No se pudo solicitar permiso para el giro.');
+      setMotionMessage('No se pudo solicitar el permiso del sensor. Puedes usar Play.');
+    }
+  };
+
+  const warmUpAudioFromClick = () => {
+    // Opcional: intentar desbloquear el elemento de audio mediante el toque en
+    // "Escanear tarjeta". Evitamos interrupciones si Safari lo rechaza.
+    if (unlockAttemptedRef.current || songRef.current || !audioRef.current) return;
+    unlockAttemptedRef.current = true;
+    try {
+      const url = silentWavUrl();
+      silenceUrlRef.current = url;
+      audioRef.current.src = url;
+      const promise = audioRef.current.play();
+      if (promise && typeof promise.catch === 'function') void promise.catch(() => {});
+    } catch {
+      // Play seguirá disponible si el navegador no admite el desbloqueo.
     }
   };
 
   const openScanner = () => {
-    pause();
-    if (!motionEnabled) requestMotionPermission();
-    scannedRef.current = false;
+    pauseSong();
+    if (!motionRequestedRef.current) authorizeMotionFromClick();
+    warmUpAudioFromClick();
+    scannerBusyRef.current = false;
     setScannerInitialized(true);
-    setScannerError(typeof window !== 'undefined' && !window.isSecureContext
-      ? 'Para abrir la cámara, utiliza HTTPS o localhost.' : '');
+    setScannerError(window.isSecureContext ? '' : 'El escáner necesita HTTPS o localhost.');
     setView('scanner');
+    viewRef.current = 'scanner';
   };
 
+  // Detecta pantalla boca abajo con ACELERÓMETRO: z aprox. -9,8 m/s².
+  // En dispositivos sin devicemotion, usa la orientación beta/gamma.
   useEffect(() => {
-    if (!motionEnabled) return undefined;
-    const onOrientation = (event) => {
-      if (viewRef.current !== 'player' || revealedRef.current || !readyRef.current) return;
-      // Beta cercano a +/-180°, gamma cercano a 0°: pantalla hacia abajo.
-      const down = Number.isFinite(event.beta) && Number.isFinite(event.gamma)
-        && Math.abs(event.beta) >= 145 && Math.abs(event.gamma) <= 50;
-      // Un giro inicia una vez. Volver a poner la pantalla hacia arriba NO pausa.
-      if (down && !flippedAlreadyRef.current && !playingRef.current) {
-        flippedAlreadyRef.current = true;
-        void play();
+    if (!motionAllowed) return undefined;
+    const acceptFaceDown = (isDown) => {
+      if (viewRef.current !== 'player' || !songRef.current || revealedRef.current
+        || finishedRef.current || autoTriggeredRef.current || playingRef.current) {
+        downSinceRef.current = null;
+        return;
+      }
+      if (!isDown) {
+        downSinceRef.current = null;
+        return;
+      }
+      const now = Date.now();
+      if (downSinceRef.current === null) {
+        downSinceRef.current = now;
+      } else if (now - downSinceRef.current >= 250 && preparedRef.current) {
+        autoTriggeredRef.current = true;
+        downSinceRef.current = null;
+        playSong();
       }
     };
+    const onMotion = (event) => {
+      const z = event.accelerationIncludingGravity?.z;
+      if (!Number.isFinite(z)) return;
+      motionSamplesSeenRef.current = true;
+      acceptFaceDown(z < -6.2);
+    };
+    const onOrientation = (event) => {
+      if (motionSamplesSeenRef.current) return;
+      const beta = event.beta;
+      const gamma = event.gamma;
+      acceptFaceDown(Number.isFinite(beta) && Number.isFinite(gamma)
+        && Math.abs(beta) > 145 && Math.abs(gamma) < 50);
+    };
+    window.addEventListener('devicemotion', onMotion);
     window.addEventListener('deviceorientation', onOrientation);
-    return () => window.removeEventListener('deviceorientation', onOrientation);
-  }, [motionEnabled, play]);
+    return () => {
+      window.removeEventListener('devicemotion', onMotion);
+      window.removeEventListener('deviceorientation', onOrientation);
+    };
+  }, [motionAllowed, playSong]);
 
-  useEffect(() => () => clearStopTimer(), [clearStopTimer]);
+  useEffect(() => () => {
+    clearEndTimer();
+    if (silenceUrlRef.current) URL.revokeObjectURL(silenceUrlRef.current);
+  }, [clearEndTimer]);
 
-  const returnToMenu = () => {
-    pause();
-    setView('menu');
+  const goMenu = () => { pauseSong(); setView('menu'); viewRef.current = 'menu'; };
+  const reveal = () => {
+    pauseSong();
+    revealedRef.current = true;
+    setIsRevealed(true);
   };
 
   const generateQR = (event) => {
     event.preventDefault();
-    if (!isValidAudioUrl(form.audioUrl)) {
-      setQrError('Pega un enlace directo HTTPS al archivo MP3, no un enlace de compartir de Google Drive.');
+    if (!validMp3Link(form.audioUrl)) {
+      setQrError('Ingresa el enlace HTTPS directo al MP3 de Cloudflare R2.');
       setQrSong(null);
       return;
     }
     setQrError('');
-    setQrSong({
-      year: form.year.trim(),
-      artist: form.artist.trim(),
-      title: form.title.trim(),
-      audioUrl: form.audioUrl.trim(),
-    });
+    setQrSong({ year: form.year.trim(), artist: form.artist.trim(), title: form.title.trim(), audioUrl: form.audioUrl.trim() });
   };
 
   const downloadQR = () => {
     if (!qrSong || !qrCanvasRef.current) return;
     try {
-      const url = qrCanvasRef.current.toDataURL('image/png');
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `QR_${safeFilename(qrSong.artist)}_${safeFilename(qrSong.title)}.png`;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
+      const png = qrCanvasRef.current.toDataURL('image/png');
+      const a = document.createElement('a');
+      a.href = png;
+      a.download = `QR_${safeFileName(qrSong.artist)}_${safeFileName(qrSong.title)}.png`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
     } catch {
-      setQrError('No se pudo descargar el PNG. Intenta desde otro navegador.');
+      setQrError('No fue posible descargar el QR. Prueba otro navegador.');
     }
-  };
-
-  const testQR = () => {
-    if (!qrSong) return;
-    if (!motionEnabled) requestMotionPermission();
-    loadSong(qrSong);
-  };
-
-  const reveal = () => {
-    pause();
-    revealedRef.current = true;
-    setIsRevealed(true);
   };
 
   return (
     <div className="min-h-screen bg-gray-900 text-white font-sans flex flex-col items-center justify-center p-6 relative">
-      {/* Un solo <audio>, sin video ni reproductor visible de YouTube. */}
+      {/* Audio HTML5 sin reproductor visual ni video. */}
       <audio
-        key={audioVersion}
         ref={audioRef}
         src={currentSong?.audioUrl || undefined}
-        preload="metadata"
+        preload="auto"
         playsInline
-        onLoadStart={onNewAudio}
-        onLoadedMetadata={() => {
-          if (!selectSegment()) setAudioError('No se pudo obtener la duración del MP3.');
+        onLoadedMetadata={prepareRandomSegment}
+        onDurationChange={prepareRandomSegment}
+        onSeeked={acknowledgeSeek}
+        onCanPlay={acknowledgeSeek}
+        onPlaying={onAudioPlaying}
+        onPause={() => { clearEndTimer(); playingRef.current = false; setIsPlaying(false); }}
+        onTimeUpdate={checkEnd}
+        onEnded={() => {
+          // Ignora fin del WAV silencioso y señales de fin anteriores al play real.
+          if (!isActiveTrack() || !startedRef.current || seekPendingRef.current) return;
+          finishFragment();
         }}
-        onPlaying={handlePlaying}
-        onPause={() => { clearStopTimer(); playingRef.current = false; setIsPlaying(false); }}
-        onTimeUpdate={checkSegmentEnd}
-        onEnded={stopAtEnd}
         onError={() => {
-          pause();
-          setAudioReady(false);
-          readyRef.current = false;
-          setAudioError('No se pudo cargar el MP3. Verifica que la URL sea pública y el archivo sea audio/mpeg.');
+          if (!isActiveTrack()) return;
+          pauseSong();
+          preparedRef.current = false;
+          setIsPrepared(false);
+          setAudioError('El MP3 no se pudo cargar. Comprueba que el enlace de R2 abra el archivo directamente.');
         }}
       />
 
       <div className="w-full max-w-md text-center mb-8 z-10">
-        <button onClick={returnToMenu} className="text-4xl font-black tracking-wider text-yellow-400">
+        <button onClick={goMenu} className="text-4xl font-black tracking-wider text-yellow-400">
           HITSTER <span className="text-white text-xl">PRO</span>
         </button>
         <p className="text-gray-400 text-sm mt-2">Tu juego musical familiar</p>
@@ -372,14 +486,11 @@ export default function HitsterApp() {
           <button onClick={() => setView('creator')} className="flex items-center justify-center gap-3 bg-gray-800 hover:bg-gray-700 p-6 rounded-2xl text-xl font-bold border border-gray-700">
             <PlusCircle size={28} /> Crear código QR MP3
           </button>
-          <p className="text-center text-gray-400 text-sm">
-            {motionMessage || 'Al tocar Escanear, Safari puede pedir permiso para la cámara y el sensor.'}
-          </p>
+          {motionMessage && <p className="text-center text-gray-400 text-sm">{motionMessage}</p>}
         </div>
       )}
 
-      {/* El lector permanece montado tras abrirlo una vez: se evitan nuevos pedidos
-          de cámara por volver del reproductor al escáner. Safari gestiona el permiso. */}
+      {/* Mantener escáner montado reduce solicitudes repetidas de cámara. */}
       {scannerInitialized && (
         <div
           aria-hidden={view !== 'scanner'}
@@ -403,7 +514,7 @@ export default function HitsterApp() {
           {view === 'scanner' && (
             <>
               {scannerError && <p role="alert" className="mt-4 p-3 rounded-xl bg-red-950 text-red-200 w-full">{scannerError}</p>}
-              <button onClick={returnToMenu} className="mt-8 text-gray-300 underline">Volver al menú</button>
+              <button onClick={goMenu} className="mt-8 text-gray-300 underline">Volver al menú</button>
             </>
           )}
         </div>
@@ -412,25 +523,20 @@ export default function HitsterApp() {
       {view === 'creator' && (
         <div className="w-full max-w-md bg-gray-800 p-6 rounded-2xl shadow-xl z-10">
           <h2 className="text-2xl font-black text-yellow-400 text-center mb-3">Generar código QR MP3</h2>
-          <p className="text-sm text-gray-300 text-center mb-6">
-            Descarga solo el código QR en PNG; diseña las tarjetas a tu gusto.
-          </p>
+          <p className="text-sm text-gray-300 text-center mb-6">Solo el QR en PNG, para que diseñes tus propias tarjetas.</p>
           <form onSubmit={generateQR} className="flex flex-col gap-4">
             {[
-              ['year', 'Año de lanzamiento', 'number', 'Ej. 1998'],
-              ['artist', 'Artista', 'text', 'Ej. Shakira'],
-              ['title', 'Nombre de la canción', 'text', 'Ej. Ciega, sordomuda'],
-              ['audioUrl', 'Enlace directo del MP3 en Cloudflare R2', 'url', 'https://...r2.dev/cancion.mp3'],
-            ].map(([key, label, type, placeholder]) => (
-              <label key={key} className="flex flex-col gap-1 text-sm font-semibold text-gray-200">
+              ['year', 'Año', 'number', 'Ej. 1988'],
+              ['artist', 'Artista', 'text', 'Ej. Soda Stereo'],
+              ['title', 'Canción', 'text', 'Ej. En la ciudad de la furia'],
+              ['audioUrl', 'Enlace público del MP3 en R2', 'url', 'https://...r2.dev/cancion.mp3'],
+            ].map(([field, label, type, placeholder]) => (
+              <label key={field} className="flex flex-col gap-1 text-sm font-semibold text-gray-200">
                 {label}
                 <input
-                  type={type}
-                  required
-                  placeholder={placeholder}
-                  value={form[key]}
+                  required type={type} placeholder={placeholder} value={form[field]}
                   onChange={(event) => {
-                    setForm((previous) => ({ ...previous, [key]: event.target.value }));
+                    setForm((old) => ({ ...old, [field]: event.target.value }));
                     setQrSong(null);
                     setQrError('');
                   }}
@@ -438,9 +544,7 @@ export default function HitsterApp() {
                 />
               </label>
             ))}
-            <button type="submit" className="bg-yellow-500 hover:bg-yellow-600 text-black font-black p-4 rounded-xl mt-2">
-              GENERAR QR
-            </button>
+            <button type="submit" className="bg-yellow-500 hover:bg-yellow-600 text-black font-black p-4 rounded-xl mt-2">GENERAR QR</button>
           </form>
           {qrError && <p role="alert" className="mt-4 p-3 bg-red-950 text-red-200 rounded-lg">{qrError}</p>}
           {qrSong && (
@@ -450,11 +554,8 @@ export default function HitsterApp() {
                 <QRCodeCanvas
                   ref={qrCanvasRef}
                   value={JSON.stringify(qrSong)}
-                  size={700}
-                  level="M"
-                  marginSize={4}
-                  bgColor="#FFFFFF"
-                  fgColor="#000000"
+                  size={700} level="M" marginSize={4}
+                  bgColor="#FFFFFF" fgColor="#000000"
                   style={{ display: 'block', width: '240px', height: '240px' }}
                 />
               </div>
@@ -462,16 +563,20 @@ export default function HitsterApp() {
               <button type="button" onClick={downloadQR} className="w-full p-4 rounded-xl font-black bg-green-500 hover:bg-green-600 flex items-center justify-center gap-2">
                 <Download size={22} /> DESCARGAR QR EN PNG
               </button>
-              <button type="button" onClick={testQR} className="w-full p-3 rounded-xl font-semibold border border-gray-500 hover:bg-gray-700">
-                Probar esta canción sin escanear
+              <button type="button" onClick={() => {
+                if (!motionRequestedRef.current) authorizeMotionFromClick();
+                warmUpAudioFromClick();
+                loadSong(qrSong);
+              }} className="w-full p-3 rounded-xl font-semibold border border-gray-500 hover:bg-gray-700">
+                Probar esta canción
               </button>
               <button type="button" onClick={() => {
-                setForm({ title: '', artist: '', year: '', audioUrl: '' });
+                setForm({ year: '', artist: '', title: '', audioUrl: '' });
                 setQrSong(null);
               }} className="w-full p-3 rounded-xl border border-gray-500">Crear otro QR</button>
             </div>
           )}
-          <button onClick={returnToMenu} className="w-full text-center mt-6 text-sm text-gray-300 underline">Volver al menú</button>
+          <button onClick={goMenu} className="w-full text-center mt-6 text-sm text-gray-300 underline">Volver al menú</button>
         </div>
       )}
 
@@ -481,17 +586,15 @@ export default function HitsterApp() {
             <h2 className="text-xl text-gray-300 font-semibold mb-6 text-center">
               {isRevealed ? 'Respuesta revelada' : 'Escucha y adivina la canción'}
             </h2>
-            <div
-              className={`relative flex items-center justify-center w-48 h-48 rounded-full bg-black border-4 border-gray-700 shadow-xl mb-6 ${isPlaying ? 'animate-spin' : ''}`}
-              style={{ animationDuration: '3s' }}
-            >
+            <div className={`relative flex items-center justify-center w-48 h-48 rounded-full bg-black border-4 border-gray-700 shadow-xl mb-6 ${isPlaying ? 'animate-spin' : ''}`}
+              style={{ animationDuration: '3s' }}>
               <div className="absolute w-16 h-16 bg-yellow-500 rounded-full flex items-center justify-center">
                 <div className="w-4 h-4 bg-gray-900 rounded-full" />
               </div>
             </div>
             <button
-              disabled={!audioReady || isRevealed}
-              onClick={() => { if (isPlaying) pause(); else void play(); }}
+              disabled={!isPrepared || isRevealed || isFinished}
+              onClick={() => { if (isPlaying) pauseSong(); else playSong(); }}
               aria-label={isPlaying ? 'Pausar canción' : 'Reproducir canción'}
               className="w-20 h-20 bg-green-500 hover:bg-green-600 disabled:opacity-40 rounded-full flex items-center justify-center shadow-lg mb-4"
             >
@@ -499,19 +602,12 @@ export default function HitsterApp() {
             </button>
             {!isRevealed && (
               <p role={audioError ? 'alert' : undefined} className="text-sm text-gray-300 mb-4 text-center min-h-10">
-                {audioError || (finished ? 'Terminó el fragmento. Pulsa Play para escuchar otro.' :
-                  !audioReady ? 'Cargando MP3...' :
-                    isPlaying ? 'Sonando: 30 segundos aleatorios.' :
-                      motionEnabled ? 'Pon el celular boca abajo o presiona Play.' :
-                        'Presiona Play. Para usar el giro, activa el permiso del sensor.')}
+                {audioError || (isFinished ? 'Los 30 segundos terminaron. Revela la respuesta o escanea otra tarjeta.'
+                  : !isPrepared ? 'Buscando automáticamente un fragmento aleatorio del MP3...'
+                    : isPlaying ? 'Reproduciendo 30 segundos aleatorios.'
+                      : motionAllowed ? 'Pon el iPhone boca abajo; si Safari lo impide, presiona Play.'
+                        : 'Presiona Play para escuchar la canción.')}
               </p>
-            )}
-            {!isRevealed && (
-              <button onClick={() => { pause(); selectSegment(); void play(); }}
-                disabled={!audioReady}
-                className="mb-5 inline-flex items-center gap-2 text-sm text-gray-300 underline disabled:opacity-40">
-                <RefreshCw size={16} /> Otro fragmento aleatorio
-              </button>
             )}
             {isRevealed && (
               <div className="w-full text-center mb-6">
