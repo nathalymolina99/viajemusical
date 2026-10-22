@@ -1,4 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
+import { readSheet } from 'read-excel-file/browser';
+import QRCode from 'qrcode';
+import JSZip from 'jszip';
 import ReactPlayer from 'react-player';
 import { QRCodeCanvas } from 'qrcode.react';
 import { QrReader } from 'react-qr-reader';
@@ -10,12 +13,41 @@ const CAMERA_CONTAINER_STYLE = { width: '100%', height: '100%', position: 'absol
 const CAMERA_VIDEO_CONTAINER_STYLE = { width: '100%', height: '100%', paddingTop: 0, position: 'relative', overflow: 'hidden' };
 const CAMERA_VIDEO_STYLE = { display: 'block', width: '100%', height: '100%', objectFit: 'cover', position: 'absolute', top: 0, left: 0 };
 
+
+// Importación Excel y generación de QR sin servicios externos ni backend.
+function normalizarEncabezado(value) {
+  return String(value ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function buscarColumna(headers, alternatives) {
+  return headers.findIndex((h) => alternatives.includes(normalizarEncabezado(h)));
+}
+
+function textoCelda(value) {
+  return String(value ?? '').trim();
+}
+
+function nombreQRSeguro(value) {
+  return String(value ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 42) || 'sin_nombre';
+}
+
 export default function HitsterApp() {
   const [view, setView] = useState('menu'); 
   const [formData, setFormData] = useState({ title: '', artist: '', year: '', youtubeId: '' });
   // Se guarda una sola canción generada; no se fabrican tarjetas ni PDFs.
   const [qrSong, setQrSong] = useState(null);
   const [qrError, setQrError] = useState('');
+  // Importación masiva: no altera el escáner ni el reproductor.
+  const [creatorMode, setCreatorMode] = useState('single');
+  const [bulkSongs, setBulkSongs] = useState([]);
+  const [bulkWarnings, setBulkWarnings] = useState([]);
+  const [bulkStatus, setBulkStatus] = useState('');
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [bulkProgress, setBulkProgress] = useState(0);
+  const [bulkFileName, setBulkFileName] = useState('');
+
   const qrCanvasRef = useRef(null);
 
   const [currentSong, setCurrentSong] = useState(null);
@@ -57,6 +89,102 @@ export default function HitsterApp() {
       return /^[a-zA-Z0-9_-]{11}$/.test(id || '') ? id : '';
     } catch {
       return '';
+    }
+  };
+
+
+  // Lee .xlsx con encabezados en cualquier orden. Ignora filas totalmente vacías.
+  const importBulkExcel = async (file) => {
+    if (!file) return;
+    setBulkSongs([]);
+    setBulkWarnings([]);
+    setBulkStatus('Leyendo Excel...');
+    setBulkFileName(file.name);
+    setBulkProgress(0);
+    try {
+      const rows = await readSheet(file);
+      if (!rows.length) throw new Error('El Excel está vacío.');
+      if (rows.length > 2001) throw new Error('Importa hasta 2.000 canciones por archivo.');
+      const headers = rows[0];
+      const idxYear = buscarColumna(headers, ['ano', 'anio', 'year', 'anolanzamiento', 'aniolanzamiento']);
+      const idxArtist = buscarColumna(headers, ['artista', 'artist', 'cantante', 'interprete']);
+      const idxTitle = buscarColumna(headers, ['cancion', 'canciontitulo', 'tema', 'title', 'titulo', 'nombrecancion', 'nombredelacancion']);
+      const idxMedia = buscarColumna(headers, ['enlaceyoutube', 'linkyoutube', 'youtube', 'youtubeid', 'linkdeyoutube', 'urlyoutube', 'enlacedeyoutube']);
+      if ([idxYear, idxArtist, idxTitle, idxMedia].some((index) => index < 0)) {
+        throw new Error('El Excel debe tener las columnas Año, Artista, Canción y Enlace YouTube.');
+      }
+      const list = [];
+      const warnings = [];
+      for (let i = 1; i < rows.length; i += 1) {
+        const row = rows[i] || [];
+        if (row.every((cell) => !textoCelda(cell))) continue;
+        const year = textoCelda(row[idxYear]);
+        const artist = textoCelda(row[idxArtist]);
+        const title = textoCelda(row[idxTitle]);
+        const media = textoCelda(row[idxMedia]);
+        if (!/^\d{4}$/.test(year) || !artist || !title || !media) {
+          warnings.push(`Fila ${i + 1}: faltan datos o el año no tiene 4 dígitos.`);
+          continue;
+        }
+        const youtubeId = extractYouTubeID(media);
+        if (!youtubeId) {
+          warnings.push(`Fila ${i + 1}: enlace de YouTube no válido.`);
+          continue;
+        }
+        list.push({ year, artist, title, youtubeId });
+      }
+      setBulkSongs(list);
+      setBulkWarnings(warnings);
+      setBulkStatus(list.length
+        ? `Se cargaron ${list.length} canciones. ${warnings.length} fila(s) omitida(s).`
+        : 'No se encontraron canciones válidas. Comprueba los encabezados y enlaces.');
+    } catch (error) {
+      setBulkStatus(error?.message || 'No se pudo abrir el Excel. Guarda el archivo en formato .xlsx.');
+    }
+  };
+
+  // Crea TODOS los códigos en PNG y descarga un solo ZIP (evita 500 descargas).
+  const downloadBulkQrs = async () => {
+    if (!bulkSongs.length || bulkBusy) return;
+    setBulkBusy(true);
+    setBulkProgress(0);
+    setBulkStatus('Generando imágenes QR...');
+    try {
+      const zip = new JSZip();
+      for (let i = 0; i < bulkSongs.length; i += 1) {
+        const song = bulkSongs[i];
+        const png = await QRCode.toDataURL(JSON.stringify(song), {
+          width: 700,
+          margin: 4,
+          errorCorrectionLevel: 'M',
+          color: { dark: '#000000', light: '#FFFFFF' },
+        });
+        const fileName = `QR_${String(i + 1).padStart(4, '0')}_${nombreQRSeguro(song.artist)}_${nombreQRSeguro(song.title)}.png`;
+        zip.file(fileName, png.substring(png.indexOf(',') + 1), { base64: true });
+        if ((i + 1) % 10 === 0 || i === bulkSongs.length - 1) {
+          setBulkProgress(Math.round(((i + 1) / bulkSongs.length) * 85));
+          // Cede tiempo a la interfaz para mostrar el porcentaje en archivos grandes.
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+      }
+      setBulkStatus('Comprimiendo ZIP...');
+      const blob = await zip.generateAsync({ type: 'blob', compression: 'STORE' }, (metadata) => {
+        setBulkProgress(85 + Math.round(metadata.percent * 0.15));
+      });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `Hitster_Pro_YouTube_${bulkSongs.length}_QR.zip`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 60000);
+      setBulkProgress(100);
+      setBulkStatus(`¡Listo! Se descargaron ${bulkSongs.length} códigos QR dentro del ZIP.`);
+    } catch (error) {
+      setBulkStatus(`No se pudo preparar el ZIP: ${error?.message || 'error desconocido'}.`);
+    } finally {
+      setBulkBusy(false);
     }
   };
 
@@ -274,11 +402,24 @@ export default function HitsterApp() {
 
       {view === 'creator' && (
         <div className="w-full max-w-md bg-gray-800 p-6 rounded-2xl shadow-xl z-10">
-          <h2 className="text-2xl font-black text-yellow-400 text-center mb-2">Generar código QR</h2>
+          <h2 className="text-2xl font-black text-yellow-400 text-center mb-2">Generar códigos QR</h2>
           <p className="text-gray-300 text-sm text-center mb-6">
             Ingresa la información de la canción. Descargarás únicamente el QR, sin tarjeta ni PDF.
           </p>
 
+
+          <div className="flex gap-2 mb-6 border-b border-gray-600 pb-3">
+            <button type="button" disabled={bulkBusy} onClick={() => setCreatorMode('single')}
+              className={`flex-1 rounded-xl p-3 font-bold ${creatorMode === 'single' ? 'bg-yellow-500 text-black' : 'bg-gray-700 text-white'}`}>
+              Una canción
+            </button>
+            <button type="button" disabled={bulkBusy} onClick={() => setCreatorMode('excel')}
+              className={`flex-1 rounded-xl p-3 font-bold ${creatorMode === 'excel' ? 'bg-yellow-500 text-black' : 'bg-gray-700 text-white'}`}>
+              Desde Excel
+            </button>
+          </div>
+          {creatorMode === 'single' ? (
+            <>
           <form onSubmit={handleGenerateQR} className="flex flex-col gap-4">
             <label className="flex flex-col gap-1 text-sm font-semibold text-gray-200">
               Año de lanzamiento
@@ -339,6 +480,38 @@ export default function HitsterApp() {
             </div>
           )}
 
+
+            </>
+          ) : (
+            <div className="flex flex-col gap-4">
+              <p className="text-sm text-gray-200">
+                Carga un Excel <strong>.xlsx</strong> con columnas <strong>Año, Artista, Canción y Enlace YouTube</strong>.
+                El orden de las columnas no importa.
+              </p>
+              <p className="text-xs text-gray-300">Pega en esa columna el enlace de YouTube de cada canción. Los códigos QR serán compatibles con el escáner de esta versión.</p>
+              <label className="block text-sm font-bold text-gray-100">
+                Seleccionar archivo Excel (.xlsx)
+                <input type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                  disabled={bulkBusy}
+                  onChange={(event) => { void importBulkExcel(event.target.files?.[0]); event.target.value = ''; }}
+                  className="mt-2 w-full p-3 bg-gray-700 rounded-xl text-white" />
+              </label>
+              {bulkFileName && <p className="text-sm text-gray-300">Archivo: {bulkFileName}</p>}
+              {bulkStatus && <p role="status" className="p-3 bg-gray-700 rounded-xl text-sm text-gray-100">{bulkStatus}</p>}
+              {bulkWarnings.length > 0 && (
+                <div className="bg-yellow-950/60 p-3 rounded-xl text-sm text-yellow-100">
+                  <p className="font-bold">Filas omitidas: {bulkWarnings.length}</p>
+                  {bulkWarnings.slice(0, 8).map((warning, i) => <p key={i}>{warning}</p>)}
+                </div>
+              )}
+              {bulkBusy && <p className="text-center text-yellow-300 font-bold">Preparando QR: {bulkProgress}%</p>}
+              <button type="button" onClick={downloadBulkQrs} disabled={!bulkSongs.length || bulkBusy}
+                className="w-full bg-green-500 hover:bg-green-600 disabled:opacity-40 text-white font-black p-4 rounded-xl flex items-center justify-center gap-2">
+                <Download size={22} /> DESCARGAR TODOS ({bulkSongs.length}) EN ZIP
+              </button>
+              <p className="text-xs text-gray-400 text-center">Se descarga un solo archivo ZIP con cada QR en PNG de alta resolución, sin tarjetas ni PDF.</p>
+            </div>
+          )}
           <button onClick={() => setView('menu')} className="w-full text-center mt-6 text-sm text-gray-400 hover:text-white underline">
             Volver al menú
           </button>
